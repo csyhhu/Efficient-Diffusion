@@ -26,5 +26,7 @@ Thumbs.db
 *.ckpt
 
 # Project specific
-outputs/
+outputs/**/*.png
+!outputs/images/channel-wise-std-histogram.png
+
 *.log
