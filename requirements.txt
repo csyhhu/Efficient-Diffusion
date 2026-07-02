@@ -1,8 +1,10 @@
 # Core
 torch>=2.5.0
+torchvision
 diffusers>=0.31.0
 transformers>=4.40.0
 accelerate>=0.30.0
+datasets
 
 # Image / Model utils
 safetensors>=0.4.0

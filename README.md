@@ -1,12 +1,36 @@
 # Efficient-Diffusion
 
-轻量级 Diffusion 模型加速与量化实验工具包。
+Light weight toolkit and experiment playground for efficient diffusion 
 
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
 ```
+
+## Walkthrough of DDPM and FM
+```python 
+# Training and sample a DDPM using MNIST dataset
+python scripts\mnist_train_ddpm.py
+```
+
+```python 
+# Training and sample a FM using MNIST dataset
+python scripts\mnist_train_fm.py
+```
+
+## Unified Training & Sampling for FP/Quantized using DDPM/FM/CM on Various Benchmark
+```python 
+# Training a Quantized Simple DiT on MNIST dataset using Flow Matching
+python main.py `
+    --model_name=quantized_dit `
+    --model_config_path=config/mnist_dit_fm/model.yaml `
+    --dataset_name=MNIST `
+    --dataset_config_path=config/mnist_dit_fm/dataset.yaml `
+    --running_config_path=config/mnist_dit_fm/running.yaml `
+    --output_dir=Results/mnist_quantized_dit_fm
+```
+
 
 ## Pre Study
 
@@ -82,6 +106,7 @@ python scripts\arch_inspect.py
 
 说明该模型各层参数的分布还是比较均匀，不需要做较多额外调整。
 
-## License
-
-MIT
+## DONE & TODO
+- [x] Quantization on Toy Benchmark (MNIST x DiT x DDPM/FM)
+- [] Quantization on Video Generation Methods
+- [] Large scale experiments

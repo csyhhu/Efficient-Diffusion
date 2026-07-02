@@ -1,0 +1,7 @@
+# MNIST dataset config
+# Used by get_dataloader("mnist", dataset_config)
+
+batch_size: 128         # training batch size
+data_dir: "./data"      # MNIST download / storage directory
+num_workers: 0          # DataLoader workers (0 = main process)
+pin_memory: false        # pin_memory for GPU (false for CPU, true for CUDA)

@@ -1,0 +1,19 @@
+# DiT (Diffusion Transformer) model config for MNIST + Flow Matching
+# Maps directly to DiT.__init__() kwargs
+
+# Input
+in_channels: 1          # MNIST grayscale
+image_size: 28          # MNIST image size (padded from 28)
+patch_size: 4           # 28 / 4 = 7 → 49 tokens
+
+# Transformer architecture
+hidden_dim: 256         # hidden dimension of transformer
+depth: 6                # number of DiT blocks
+num_heads: 4            # attention heads (must divide hidden_dim)
+time_dim: 256           # time embedding dimension
+mlp_ratio: 4.0          # MLP hidden / transformer hidden ratio
+
+# Quantization
+bitW: 8                 # bits for quantized weights
+bitA: 8                 # bits for quantized activations
+bitG: 32                # bits for quantized gradients

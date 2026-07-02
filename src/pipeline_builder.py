@@ -12,7 +12,7 @@ import copy
 import torch
 from diffusers import DDIMScheduler
 
-from quant_utils import symmetric_quantize, asymmetric_quantize
+from .quant_utils import symmetric_quantize, asymmetric_quantize
 
 
 # ---------------------------------------------------------------------------
@@ -166,10 +166,11 @@ apply_alpha_quantization = apply_alpha_int8
 
 
 if __name__ == "__main__":
+    
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-    from model_loader import load_model
+    from .model_loader import load_model
 
     # Load full pipeline with weights
     print("Loading SD model with weights ...")

@@ -1,0 +1,20 @@
+# Running / Training config for MNIST + DiT + Consistency Model
+# Referenced by main.py training loop
+
+# ── Scheduler ──
+sample_type: "cm"           # "ddpm" | "fm" | "cm"
+scheduler: "cm"             # triggers ConsistencyModelScheduler
+
+# ── CM-specific ──
+cm_num_discretization: 40   # number of sigma levels (Karras discretization)
+cm_sigma_min: 0.002         # min noise scale
+cm_sigma_max: 80.0          # max noise scale
+cm_ema_decay: 0.9999        # EMA decay rate for target network
+cm_sampling_steps: null     # null = use training discretization; set to e.g. 8 for few-step sampling
+
+# ── Training ──
+lr: 0.0001                  # learning rate (Adam)
+epochs: 100                 # number of training epochs
+
+# ── Sampling ──
+sample_interval: 10         # generate sample images every N epochs
