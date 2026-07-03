@@ -1,7 +1,7 @@
 r"""
 Usage
 
-    # Flow Matching
+    # Flow Matching — quantized DiT
     python main.py `
         --model_name=quantized_dit `
         --model_config_path=config/mnist_dit_fm/model.yaml `
@@ -9,6 +9,15 @@ Usage
         --dataset_config_path=config/mnist_dit_fm/dataset.yaml `
         --running_config_path=config/mnist_dit_fm/running.yaml `
         --output_dir=Results/mnist_quantized_dit_fm
+
+    # Flow Matching — NVFP4-quantized DiT
+    python main.py `
+        --model_name=nvfp4_dit `
+        --model_config_path=config/mnist_dit_fm/model.yaml `
+        --dataset_name=MNIST `
+        --dataset_config_path=config/mnist_dit_fm/dataset.yaml `
+        --running_config_path=config/mnist_dit_fm/running.yaml `
+        --output_dir=Results/mnist_nvfp4_dit_fm
 
     # Consistency Model
     python main.py `
@@ -146,7 +155,11 @@ if __name__ == "__main__":
         t0_epoch = time.time()
         batch_times = []
 
-        for x, _ in pbar:
+        for idx, (x, _) in enumerate(pbar):
+
+            if idx > 10:
+                break
+
             x = x.to(device)
             B = x.shape[0]
             t0_batch = time.time()
@@ -186,7 +199,7 @@ if __name__ == "__main__":
             loss.backward()
 
             # Record per-layer quantization error (quantized models only)
-            quantization_error_info = model.get_quantization_error() if hasattr(model, "get_quantization_error") else {}
+            quantization_error_info = model.quantization_error_info if hasattr(model, "quantization_error_info") else {}
             if quantization_error_info:
                 for layer, error in quantization_error_info.items():
                     quant_error_records.setdefault(layer, []).append((global_step, error))

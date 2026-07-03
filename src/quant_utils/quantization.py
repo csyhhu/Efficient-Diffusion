@@ -102,6 +102,375 @@ class AsymmetricQuantization(torch.autograd.Function):
 
 
 
+# ============================================================================
+# NVFP4 Format Constants
+# ============================================================================
+
+# FP4 (E2M1) format: 1 sign, 2 exponent, 1 mantissa (bias=1)
+# Representable positive values: 0, 0.5, 1, 1.5, 2, 3, 4, 6
+FP4_POS_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+FP4_MAX = 6.0
+
+# E4M3 format (block scale): 1 sign, 4 exponent, 3 mantissa (bias=7)
+FP8_MAX = 448.0
+
+
+def _generate_e4m3_positive_values(max_val=FP8_MAX):
+    """Generate all positive representable values in E4M3 format (FP8).
+    
+    E4M3: 1 sign, 4 exponent, 3 mantissa, bias=7.
+    Subnormals: e=0, value = (m/8) * 2^{-6}
+    Normals: e=1..15, value = 2^{e-7} * (1 + m/8)
+    """
+    values = {0.0}
+    # Subnormals: e = 0
+    for m in range(8):
+        v = (m / 8.0) * (2.0 ** -6)
+        if v <= max_val:
+            values.add(v)
+    # Normals: e = 1 to 15
+    for e in range(1, 16):
+        for m in range(8):
+            v = (2.0 ** (e - 7)) * (1.0 + m / 8.0)
+            if v <= max_val:
+                values.add(v)
+    return torch.tensor(sorted(values), dtype=torch.float32)
+
+
+E4M3_VALUES = _generate_e4m3_positive_values()
+
+
+def _nearest_quantize(x, ref_values):
+    """Quantize x to nearest value in ref_values (sorted, 1D tensor).
+    
+    Args:
+        x: input tensor of any shape
+        ref_values: sorted 1D tensor of representable values
+    
+    Returns:
+        quantized tensor with same shape as x
+    """
+    orig_shape = x.shape
+    x_flat = x.reshape(-1)
+    # Ensure x is on the same device as ref_values
+    ref_values = ref_values.to(x.device)
+    # Clamp x to valid range before searchsorted
+    x_flat = x_flat.clamp(min=ref_values[0], max=ref_values[-1])
+    # Binary search to find insertion positions
+    idx = torch.searchsorted(ref_values, x_flat)
+    idx = idx.clamp(1, len(ref_values) - 1)
+    left = ref_values[idx - 1]
+    right = ref_values[idx]
+    diff_left = x_flat - left
+    diff_right = right - x_flat
+    nearest = torch.where(diff_left <= diff_right, left, right)
+    return nearest.reshape(orig_shape)
+
+
+def quantize_to_e4m3(x):
+    """Quantize input to nearest E4M3 (FP8 block scale) representable value.
+    
+    Args:
+        x: tensor of any shape (assumed non-negative for scale factors)
+    
+    Returns:
+        quantized tensor with nearest E4M3 values
+    """
+    return _nearest_quantize(x, E4M3_VALUES)
+
+
+def quantize_to_fp4(x):
+    """Quantize input to nearest FP4 (E2M1) value.
+    
+    Handles signed input by quantizing absolute values and restoring sign.
+    Values outside [-6, 6] are clipped to the boundary.
+    
+    Args:
+        x: tensor of any shape
+    
+    Returns:
+        quantized tensor of FP4 values
+    """
+    # Clip to valid FP4 range
+    x_clipped = x.clamp(-FP4_MAX, FP4_MAX)
+    x_abs = x_clipped.abs()
+    x_sign = torch.sign(x_clipped)
+    # Handle zero sign correctly (keep positive)
+    x_sign = torch.where(x_sign == 0, torch.ones_like(x_sign), x_sign)
+    # Quantize absolute values
+    nearest_abs = _nearest_quantize(x_abs, FP4_POS_VALUES)
+    return x_sign * nearest_abs
+
+
+# ============================================================================
+# Core NVFP4 quantization function
+# ============================================================================
+
+def _nvfp4_quantize_core(x_groups, block_size=16):
+    """Core NVFP4 quantize + dequantize on partitioned blocks.
+
+    This is the shared quantization engine for both tensor-wise and token-wise
+    NVFP4 quantization. Each group (dimension 0) is quantized independently
+    with its own global scale.
+
+    Args:
+        x_groups: float tensor of shape [G, N, block_size] where
+                  G = number of independent quantization groups,
+                  N = number of blocks per group,
+                  block_size = elements per block.
+        block_size: elements per block (default 16).
+
+    Returns:
+        x_deq_groups: dequantized tensor of shape [G, N, block_size].
+        s_global: per-group FP32 global scale, shape [G].
+        s_block: per-group per-block E4M3 scale, shape [G, N].
+    """
+    device = x_groups.device
+    G, N, B = x_groups.shape
+
+    # --- Step 1: Per-group per-block amax: [G, N] ---
+    block_amax = x_groups.abs().max(dim=-1).values  # [G, N]
+
+    # --- Step 2: Per-group global amax: [G] ---
+    global_amax = block_amax.max(dim=-1).values  # [G]
+
+    # Handle all-zero groups: use a dummy scale to avoid NaN, restore later
+    zero_mask = (global_amax == 0)  # [G]
+    global_amax_safe = global_amax.clamp(min=1e-10)
+
+    # --- Step 3: Per-group s_global (FP32): [G] ---
+    s_global = global_amax_safe / (FP8_MAX * FP4_MAX)  # [G]
+
+    # --- Step 4: Per-group per-block s_block (E4M3): [G, N] ---
+    s_block_ideal = (block_amax / FP4_MAX) / s_global.unsqueeze(-1)  # [G, N]
+    s_block = quantize_to_e4m3(s_block_ideal)
+    s_block = s_block.clamp(min=1e-10)
+
+    # --- Step 5: Build per-element scale: [G, N, B] ---
+    s_global_exp = s_global.unsqueeze(-1).unsqueeze(-1)  # [G, 1, 1]
+    s_block_exp = s_block.unsqueeze(-1)                   # [G, N, 1]
+    s_elem = s_global_exp * s_block_exp                   # [G, N, B]
+
+    # --- Step 6: Quantize and dequantize ---
+    x_scaled = x_groups / s_elem
+    x_fp4 = quantize_to_fp4(x_scaled)
+    x_deq_groups = x_fp4 * s_elem
+
+    # --- Step 7: Restore all-zero groups ---
+    if zero_mask.any():
+        x_deq_groups = torch.where(
+            zero_mask.unsqueeze(-1).unsqueeze(-1),
+            x_groups,
+            x_deq_groups,
+        )
+        s_global = torch.where(zero_mask, torch.zeros_like(s_global), s_global)
+
+    return x_deq_groups, s_global, s_block
+
+
+def _to_block_padded(x_1d, block_size):
+    """Pad a 1D tensor to a multiple of block_size and reshape to 2D blocks.
+
+    Args:
+        x_1d: 1D tensor of shape [total_elements].
+        block_size: block size.
+
+    Returns:
+        x_blocks: [num_blocks, block_size], the padded block view.
+        pad_size: number of zero-pad elements appended (0 if no pad needed).
+    """
+    total = x_1d.numel()
+    pad_size = (block_size - total % block_size) % block_size
+    if pad_size > 0:
+        x_1d = torch.cat([x_1d, torch.zeros(pad_size, device=x_1d.device, dtype=x_1d.dtype)])
+    x_blocks = x_1d.reshape(-1, block_size)
+    return x_blocks, pad_size
+
+
+def _from_block_padded(x_deq_blocks, pad_size):
+    """Reverse _to_block_padded: flatten blocks back to 1D and remove padding.
+
+    Args:
+        x_deq_blocks: [num_blocks, block_size].
+        pad_size: number of padded elements to strip.
+
+    Returns:
+        1D tensor without padding.
+    """
+    x_1d = x_deq_blocks.reshape(-1)
+    if pad_size > 0:
+        x_1d = x_1d[:-pad_size]
+    return x_1d
+
+
+# ============================================================================
+# NVFP4 Tensor-wise Quantization (single global scale)
+# ============================================================================
+
+class NVFP4Quantization(torch.autograd.Function):
+    """NVFP4 4-bit floating-point quantization with two-level scaling.
+
+    Quantizes the ENTIRE input tensor with a single global FP32 scale.  All
+    elements share the same s_global; only block-level (E4M3) scales vary.
+
+    Implements the NVFP4 format introduced in NVIDIA Blackwell architecture:
+    - Element format: E2M1 (1 sign, 2 exponent, 1 mantissa) = 4-bit
+    - Block size: 16 elements per scaling block
+    - Block scale: E4M3 (1 sign, 4 exponent, 3 mantissa) = 8-bit per block
+    - Global scale: FP32 per tensor = 32-bit per tensor
+
+    Quantization formula:
+        s_global = amax_global / (FP8_MAX × FP4_MAX)
+        s_block  = quantize_e4m3(amax_block / FP4_MAX / s_global)
+        x_fp4    = quantize_fp4(x / (s_global × s_block))
+        x_hat    = x_fp4 × s_global × s_block
+
+    Reference:
+        NVIDIA. "Quantization-Aware Distillation for NVFP4 Inference Accuracy Recovery." 2026.
+    """
+
+    @staticmethod
+    def forward(ctx, x_, block_size_=16, error_info_=None, module_prefix_=None):
+        """Forward pass: quantize input tensor using NVFP4 two-level scaling.
+
+        Args:
+            x_: input tensor of any shape.
+            block_size_: number of elements per scaling block (default: 16).
+            error_info_: optional dict to store error statistics.
+            module_prefix_: optional prefix for error_info_ keys.
+
+        Returns:
+            dequantized output tensor with same shape as input.
+        """
+        orig_shape = x_.shape
+
+        # Flatten → pad → blocks
+        x_blocks, pad_size = _to_block_padded(x_.reshape(-1).float(), block_size_)
+
+        # Core quantize (G=1: single global scale)
+        x_groups = x_blocks.unsqueeze(0)  # [1, N, block_size]
+        x_deq_groups, s_global, _ = _nvfp4_quantize_core(x_groups, block_size_)
+        x_deq_blocks = x_deq_groups.squeeze(0)  # [N, block_size]
+
+        # Remove padding → restore shape
+        x_deq = _from_block_padded(x_deq_blocks, pad_size).reshape(orig_shape)
+
+        # Store for backward
+        ctx.save_for_backward(x_)
+        ctx.error_info_ = error_info_
+        ctx.module_prefix_ = module_prefix_
+
+        # Compute quantization error info
+        if error_info_ is not None:
+            prefix = f"{module_prefix_}." if module_prefix_ is not None else ""
+            quantization_error = (x_ - x_deq).float()
+            error_info_[f"{prefix}nvfp4_error_mse"] = (quantization_error ** 2).mean().item()
+            error_info_[f"{prefix}nvfp4_error_mae"] = quantization_error.abs().mean().item()
+            error_info_[f"{prefix}nvfp4_s_global"] = s_global.squeeze().item()
+
+        return x_deq
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: Straight-Through Estimator (STE).
+
+        Gradients pass through unchanged since the quantization function
+        is treated as identity in the backward pass.
+        """
+        return grad_output, None, None, None
+
+
+# ============================================================================
+# NVFP4 Token-wise Activation Quantization (per-token global scale)
+# ============================================================================
+
+class NVFP4ActivationQuantization(torch.autograd.Function):
+    """NVFP4 activation quantization with per-token (token-wise) two-level scaling.
+
+    For input of shape [bs, n_seq, dim], each token (a slice along the last
+    dimension) is quantized independently with its own FP32 global scale and
+    per-block E4M3 scales.  This provides finer-grained dynamic range adaptation
+    compared to sharing a single global scale across all tokens.
+
+    This differs from NVFP4Quantization in that:
+        - NVFP4Quantization: one s_global for the ENTIRE tensor.
+        - NVFP4ActivationQuantization: one s_global PER TOKEN (bs × n_seq).
+
+    Uses the same E2M1 / E4M3 / FP32 two-level scaling as NVFP4Quantization.
+    """
+
+    @staticmethod
+    def forward(ctx, x_, block_size_=16, error_info_=None, module_prefix_=None):
+        """Forward pass: token-wise NVFP4 quantization.
+
+        Args:
+            x_: input tensor of shape [bs, n_seq, dim].
+            block_size_: elements per scaling block (default: 16).
+            error_info_: optional dict to store error statistics.
+            module_prefix_: optional prefix for error_info_ keys.
+
+        Returns:
+            dequantized tensor with shape [bs, n_seq, dim].
+        """
+        if x_.dim() != 3:
+            raise ValueError(
+                f"NVFP4ActivationQuantization expects 3D input [bs, n_seq, dim], "
+                f"but got {x_.dim()}D: {x_.shape}"
+            )
+
+        bs, n_seq, dim = x_.shape
+        device = x_.device
+
+        # Merge batch and sequence dimensions: [num_tokens, dim]
+        num_tokens = bs * n_seq
+        x_2d = x_.reshape(num_tokens, dim).float()
+
+        # Pad last dim and reshape to blocks: [num_tokens, num_blocks, block_size]
+        pad_dim = (block_size_ - dim % block_size_) % block_size_
+        if pad_dim > 0:
+            x_pad = torch.nn.functional.pad(x_2d, (0, pad_dim))
+        else:
+            x_pad = x_2d
+        dim_padded = dim + pad_dim
+        num_blocks = dim_padded // block_size_
+
+        x_groups = x_pad.reshape(num_tokens, num_blocks, block_size_)  # [G, N, B]
+
+        # Core quantize (G = num_tokens: one global scale per token)
+        x_deq_groups, s_global, _ = _nvfp4_quantize_core(x_groups, block_size_)
+
+        # Reshape back: [num_tokens, num_blocks, block_size] → [num_tokens, dim_padded]
+        x_deq_pad = x_deq_groups.reshape(num_tokens, dim_padded)
+
+        # Remove padding → [num_tokens, dim]
+        if pad_dim > 0:
+            x_deq_2d = x_deq_pad[:, :dim]
+        else:
+            x_deq_2d = x_deq_pad
+
+        # Restore original shape
+        x_deq = x_deq_2d.reshape(bs, n_seq, dim)
+
+        # Store for backward
+        ctx.save_for_backward(x_)
+        ctx.error_info_ = error_info_
+        ctx.module_prefix_ = module_prefix_
+
+        # Compute quantization error info
+        if error_info_ is not None:
+            prefix = f"{module_prefix_}." if module_prefix_ is not None else ""
+            quantization_error = (x_ - x_deq).float()
+            error_info_[f"{prefix}nvfp4_act_error_mse"] = (quantization_error ** 2).mean().item()
+            error_info_[f"{prefix}nvfp4_act_error_mae"] = quantization_error.abs().mean().item()
+
+        return x_deq
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: Straight-Through Estimator (STE)."""
+        return grad_output, None, None, None
+
+
 def quantization_check(quantized_x_, num_bits_):
 
     assert len(torch.unique(quantized_x_)) <= 2**num_bits_
@@ -112,30 +481,39 @@ if __name__ == "__main__":
     import torch
 
     batch_size = 10
-    hidden_dim_1 = 30
-    hidden_dim_2 = 40
-    bit = 2
+    n_seq = 5
+    hidden_dim_1 = 3
+    hidden_dim_2 = 4
+    bit = 4
 
     # x = torch.randn(hidden_dim_1, hidden_dim_2)
-    x = torch.randn(batch_size, hidden_dim_1)
+    x = torch.randn(batch_size, n_seq, hidden_dim_1)
+    w = torch.randn(hidden_dim_1, hidden_dim_2)
+    output = x @ w
     
     # quantized_x = asymmetric_quantization(x, bit, 0.0, 1.0)
     # quantization_check(quantized_x, bit)
 
     error_info = {}
-
-    left_threshold = torch.nn.Parameter(torch.zeros(hidden_dim_1))
-    right_threshold = torch.nn.Parameter(torch.ones(hidden_dim_1))
-    quantized_x = AsymmetricQuantization.apply(x, bit, left_threshold, right_threshold, -2, error_info)
-    # left_threshold = torch.nn.Parameter(torch.zeros(hidden_dim_2))
-    # right_threshold = torch.nn.Parameter(torch.ones(hidden_dim_2))
-    # quantized_x = AsymmetricQuantization.apply(x, bit, left_threshold, right_threshold, -1)
-    # left_threshold = torch.nn.Parameter(torch.tensor(0.0))
-    # right_threshold = torch.nn.Parameter(torch.tensor(1.0))
-    # quantized_x = AsymmetricQuantization.apply(x, bit, left_threshold, right_threshold, None)
-    loss = torch.nn.MSELoss()(x, quantized_x)
-    loss.backward()
-    print(loss)
-    # print(left_threshold.grad.shape)
-    # print(right_threshold.grad.shape)
-    print(error_info)
+    # """
+    # Learnable Threshold for INT Quantization
+    activateion_left_threshold = torch.nn.Parameter(torch.zeros([]))
+    activateion_right_threshold = torch.nn.Parameter(torch.ones([]))
+    quantized_x = AsymmetricQuantization.apply(x, bit, activateion_left_threshold, activateion_right_threshold, None, error_info, "activation")
+    paramater_left_threshold = torch.nn.Parameter(torch.zeros(hidden_dim_2))
+    paramater_right_threshold = torch.nn.Parameter(torch.ones(hidden_dim_2))
+    quantized_w = AsymmetricQuantization.apply(w, bit, paramater_left_threshold, paramater_right_threshold, -2, error_info, "parameter")
+    quantized_output = quantized_x @ quantized_w
+    print(torch.mean(torch.abs(output - quantized_output)))
+    # loss = torch.nn.MSELoss()(x, quantized_x)
+    # loss.backward()
+    # print(loss)
+    # print(error_info)
+    # """
+    # Statistic for FP4 Quantization
+    quantized_w = NVFP4Quantization.apply(w, 16, error_info, "parameter")
+    quantized_x = NVFP4ActivationQuantization.apply(x, 16, error_info, "activation")
+    quantized_output = quantized_x @ quantized_w
+    # print(x)
+    # print(quantized_x)
+    print(torch.mean(torch.abs(output - quantized_output)))

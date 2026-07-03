@@ -35,6 +35,7 @@ import torch.nn as nn
 
 from src.models.dit import DiT
 from src.models.quantized_dit import QuantizedDiT
+from src.models.nvfp4_quantized_dit import NVFP4DiT
 from src.models.quantized_SD3 import QuantizedSD3
 from src.models.quantized_PixArt import QuantizedPixArt
 
@@ -48,6 +49,7 @@ _MODEL_REGISTRY: dict[str, type] = {
     "dit":              DiT,
     "simple":           DiT,          # alias
     "quantized_dit":    QuantizedDiT,
+    "nvfp4_dit":        NVFP4DiT,
     "quantized_sd3":    QuantizedSD3,
     "quantized_pixart": QuantizedPixArt,
 }
