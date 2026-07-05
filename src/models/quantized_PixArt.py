@@ -817,10 +817,51 @@ class QuantizedPixArt(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import torch
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    import os
+    import torch
+    from diffusers import DiffusionPipeline
+    import matplotlib.pyplot as plt
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
+
+    # Load from local cache (PixArt-Sigma-XL-2-1024-MS, already cached locally)
+    model_id = "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+    print(f"Loading {model_id} from local cache ...")
+    pipe = DiffusionPipeline.from_pretrained(
+        model_id, dtype=torch.bfloat16, device_map=device, local_files_only=False
+    )
+
+    prompt = "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
+    image = pipe(prompt).images[0]
+
+    # Save the generated image with prompt text overlaid
+    from PIL import ImageDraw, ImageFont
+
+    output_dir = "outputs/images"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Add prompt text at the bottom of the image
+    draw = ImageDraw.Draw(image)
+    # Use a simple text overlay at the top of the image
+    text = prompt
+    # Draw a semi-transparent background for the text
+    text_bbox = draw.textbbox((0, 0), text)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+    padding = 8
+    # Draw a black rectangle at the top as text background
+    draw.rectangle([(0, 0), (image.width, text_height + padding * 2)], fill=(0, 0, 0, 180))
+    draw.text((padding, padding), text, fill=(255, 255, 255))
+
+    # Save image
+    save_path = os.path.join(output_dir, "pixart_sample.png")
+    image.save(save_path)
+    print(f"Image saved to: {save_path}")
+    print(f"Prompt: {prompt}")
+
+    """
     bitW, bitA, bitG = 8, 8, 8
 
     print("=" * 60)
@@ -875,3 +916,4 @@ if __name__ == "__main__":
     print(f"  quantization_error_info keys ({len(quantization_error_info)}):")
     for k in sorted(quantization_error_info.keys()):
         print(f"    {k}  {quantization_error_info[k].shape}")
+    """
