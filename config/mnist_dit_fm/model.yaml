@@ -14,6 +14,6 @@ time_dim: 256           # time embedding dimension
 mlp_ratio: 4.0          # MLP hidden / transformer hidden ratio
 
 # Quantization
-bitW: 8                 # bits for quantized weights
-bitA: 8                 # bits for quantized activations
-bitG: 32                # bits for quantized gradients
+# bitW: 8                 # bits for quantized weights
+# bitA: 8                 # bits for quantized activations
+# bitG: 32                # bits for quantized gradients

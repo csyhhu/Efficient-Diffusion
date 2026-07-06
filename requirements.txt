@@ -26,3 +26,6 @@ psutil>=5.9.0
 
 # Config
 omegaconf>=2.3.0
+
+# 
+modelscope

@@ -157,8 +157,8 @@ if __name__ == "__main__":
 
         for idx, (x, _) in enumerate(pbar):
 
-            if idx > 10:
-                break
+            # if idx > 10:
+            #     break
 
             x = x.to(device)
             B = x.shape[0]

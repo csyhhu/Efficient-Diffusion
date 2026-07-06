@@ -715,7 +715,8 @@ if __name__ == "__main__":
     print(f"Downloading {model_id} via ModelScope ...")
     local_path = snapshot_download(
         model_id,
-        cache_dir="C:/Users/Shangyu/.cache/modelscope",
+        # cache_dir="C:/Users/Shangyu/.cache/modelscope",
+        cache_dir=".cache/modelscope",
         allow_patterns=[
             "**/*fp16*",             # all fp16 safetensors weights
             "**/*.json",             # all JSON configs (model_index, config, scheduler, etc.)
