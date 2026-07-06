@@ -174,6 +174,7 @@ if __name__ == "__main__":
     os.makedirs("./outputs", exist_ok=True)
 
     # ── Test 1: MNIST ──
+    """
     print("=" * 60)
     print("Test 1: MNIST via get_dataloader")
     train_loader, val_loader = get_dataloader(
@@ -185,6 +186,7 @@ if __name__ == "__main__":
     print(f"  Batch shape: x={tuple(x.shape)}, y={tuple(y.shape)}")
     print(f"  x range: [{x.min().item():.4f}, {x.max().item():.4f}]")
     print()
+    """
 
     # ── Test 2: T2I with RandomVAE + RandomTokenizer ──
     print("=" * 60)
@@ -215,6 +217,30 @@ if __name__ == "__main__":
 
     train_loader, val_loader = get_dataloader(
         "pokemon",
+        {
+            "batch_size": 4,
+            "max_samples": 10,
+            "val_samples": 4,
+            "image_size": 128,
+            "dtype": "float32",
+            "max_token_length": 77,
+        },
+        vae=vae_dummy,
+        tokenizer=tok_dummy,
+    )
+    latent, tokens = next(iter(train_loader))
+    print(f"  Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    print(f"  Latent shape: {tuple(latent.shape)}")
+    print(f"  input_ids shape: {tuple(tokens['input_ids'].shape)}")
+    print(f"  attention_mask shape: {tuple(tokens['attention_mask'].shape)}")
+    print()
+
+    # ── Test 3: T2I (coco) via get_dataloader ──
+    print("=" * 60)
+    print("Test 3: T2I (coco) via get_dataloader (dry-run VAE/tokenizer)")
+
+    train_loader, val_loader = get_dataloader(
+        "coco",
         {
             "batch_size": 4,
             "max_samples": 10,

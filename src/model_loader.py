@@ -207,6 +207,33 @@ def _load_real_t5_tokenizer(pretrained_path: str = "PixArt-alpha/PixArt-Sigma-XL
 
 
 # ---------------------------------------------------------------------------
+# HF token resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_hf_token(cfg: dict) -> str | bool | None:
+    """Resolve HuggingFace token from config or environment.
+
+    Priority: cfg["hf_token"] > env HF_TOKEN > huggingface-cli login cache.
+    Returns ``True`` if CLI-logged-in, ``str`` if token set, ``None`` if no auth.
+    """
+    token = cfg.get("hf_token", None)
+    if token is not None:
+        return token
+
+    token = os.environ.get("HF_TOKEN", None)
+    if token is not None:
+        return token
+
+    # Check if logged in via huggingface-cli
+    try:
+        from huggingface_hub import whoami
+        whoami()
+        return True  # already authenticated
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # from_pretrained helpers
 # ---------------------------------------------------------------------------
 
@@ -221,9 +248,11 @@ def _load_sd3_pretrained(model: QuantizedSD3, cfg: dict):
 
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
+    token = _resolve_hf_token(cfg)
+
     logger.info("Loading pretrained SD3 weights from %s (subfolder=%s) ...",
                 pretrained_path, subfolder)
-    model.from_pretrained(pretrained_path, subfolder=subfolder)
+    model.from_pretrained(pretrained_path, subfolder=subfolder, token=token)
     logger.info("SD3 weights loaded successfully.")
 
 
@@ -238,9 +267,11 @@ def _load_pixart_pretrained(model: QuantizedPixArt, cfg: dict):
 
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
+    token = _resolve_hf_token(cfg)
+
     logger.info("Loading pretrained PixArt weights from %s (subfolder=%s) ...",
                 pretrained_path, subfolder)
-    model.from_pretrained(pretrained_path, subfolder=subfolder)
+    model.from_pretrained(pretrained_path, subfolder=subfolder, token=token)
     logger.info("PixArt weights loaded successfully.")
 
 

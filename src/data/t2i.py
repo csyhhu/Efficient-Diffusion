@@ -872,6 +872,7 @@ if __name__ == "__main__":
     os.makedirs("./outputs", exist_ok=True)
 
     # ---- Test 1: Raw DataLoader ----
+    """
     print("=" * 50)
     print("Stage 1 — Raw DataLoader  (load_t2i_data_raw)")
     print("=" * 50)
@@ -891,6 +892,7 @@ if __name__ == "__main__":
     )
 
     shutil.rmtree(tmpdir, ignore_errors=True)
+    """
 
     # ---- Test 2: Two-stage workflow ----
     """

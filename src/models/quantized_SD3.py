@@ -707,40 +707,82 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ---- Download SD3 Medium diffusers format from ModelScope ----
-    from modelscope import snapshot_download
+    # ---- Choose download source ----
+    # SD3 is a gated model on HuggingFace (requires auth + license acceptance).
+    # Default: ModelScope (no auth needed).
+    # To use HuggingFace (requires HF_TOKEN):
+    #   $env:DOWNLOAD_SOURCE="huggingface"
+    #   $env:HF_TOKEN="hf_xxxxxxxxxxxx"
+    DOWNLOAD_SOURCE = os.environ.get("DOWNLOAD_SOURCE", "hf").lower()
+
     from diffusers import StableDiffusion3Pipeline
 
-    model_id = "AI-ModelScope/stable-diffusion-3-medium-diffusers"
-    print(f"Downloading {model_id} via ModelScope ...")
-    local_path = snapshot_download(
-        model_id,
-        # cache_dir="C:/Users/Shangyu/.cache/modelscope",
-        cache_dir=".cache/modelscope",
-        allow_patterns=[
-            "**/*fp16*",             # all fp16 safetensors weights
-            "**/*.json",             # all JSON configs (model_index, config, scheduler, etc.)
-            "*.json",                # root config files
-            "*.txt",                 # root text files
-            "**/*.txt",              # tokenizer vocab/merges in subdirs
-            "**/tokenizer.json",     # tokenizer files in text_encoder dirs
-            "**/tokenizer_config.json",
-            "**/special_tokens_map.json",
-        ],
-        ignore_patterns=[
-            "**/text_encoder_3/**",  # skip T5-XXL (~9GB, not required)
-        ],
-    )
-    print(f"Model cached at: {local_path}")
+    if DOWNLOAD_SOURCE == "modelscope":
+        # ==================== ModelScope (no auth required) ====================
+        from modelscope import snapshot_download
 
-    # ---- Load pipeline from local diffusers directory ----
-    print("Loading pipeline ...")
-    pipe = StableDiffusion3Pipeline.from_pretrained(
-        local_path,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        variant="fp16",            # use fp16 variant of weight files
-        local_files_only=True,
-    )
+        model_id = "AI-ModelScope/stable-diffusion-3-medium-diffusers"
+        print(f"Downloading {model_id} via ModelScope ...")
+        local_path = snapshot_download(
+            model_id,
+            # cache_dir="C:/Users/Shangyu/.cache/modelscope",
+            cache_dir=".cache/modelscope",
+            allow_patterns=[
+                "**/*fp16*",             # all fp16 safetensors weights
+                "**/*.json",             # all JSON configs (model_index, config, scheduler, etc.)
+                "*.json",                # root config files
+                "*.txt",                 # root text files
+                "**/*.txt",              # tokenizer vocab/merges in subdirs
+                "**/tokenizer.json",     # tokenizer files in text_encoder dirs
+                "**/tokenizer_config.json",
+                "**/special_tokens_map.json",
+            ],
+            ignore_patterns=[
+                "**/text_encoder_3/**",  # skip T5-XXL (~9GB, not required)
+            ],
+        )
+        print(f"Model cached at: {local_path}")
+
+        print("Loading pipeline ...")
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            local_path,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            variant="fp16",
+            local_files_only=True,
+        )
+    else:
+        # ==================== HuggingFace (requires auth token) ====================
+        # 1. Accept license at: https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers
+        # 2. Create token at: https://huggingface.co/settings/tokens
+        # 3. Set env: $env:HF_TOKEN="YOUR_HF_TOKEN_HERE"
+        hf_token = os.environ.get("HF_TOKEN", None)
+        if hf_token is None:
+            from huggingface_hub import whoami
+            try:
+                whoami()
+                hf_token = True  # already logged in via `huggingface-cli login`
+            except Exception:
+                pass
+
+        if hf_token is None:
+            raise RuntimeError(
+                "SD3 is gated on HuggingFace. Authenticate via one of:\n"
+                "  1. Set $env:HF_TOKEN=\"hf_xxx\"\n"
+                "  2. Run: huggingface-cli login\n"
+                "  3. Use ModelScope instead: $env:DOWNLOAD_SOURCE=\"modelscope\""
+            )
+
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+        model_id = "stabilityai/stable-diffusion-3-medium-diffusers"
+        print(f"Loading {model_id} via HuggingFace (mirror: {os.environ.get('HF_ENDPOINT')}) ...")
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            variant="fp16",
+            token=hf_token if isinstance(hf_token, str) else True,
+        )
+
     # Use CPU offload to avoid OOM: keeps components on CPU,
     # only moves one to GPU at a time during inference.
     if device == "cuda":
