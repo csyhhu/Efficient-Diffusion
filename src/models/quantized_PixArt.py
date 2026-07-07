@@ -826,12 +826,22 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
 
+    # -- Model cache directory (default: HuggingFace default cache) --
+    cache_dir = os.environ.get("MODEL_CACHE_DIR", None)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ.setdefault("HF_HOME", cache_dir)
+        print(f"Model cache dir set to: {cache_dir}")
+
     # Load from local cache (PixArt-Sigma-XL-2-1024-MS, already cached locally)
     model_id = "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
-    print(f"Loading {model_id} from local cache ...")
-    pipe = DiffusionPipeline.from_pretrained(
-        model_id, dtype=torch.bfloat16, device_map=device, local_files_only=False
+    load_kwargs = dict(
+        dtype=torch.bfloat16, device_map=device, local_files_only=False,
     )
+    if cache_dir:
+        load_kwargs["cache_dir"] = cache_dir
+    print(f"Loading {model_id} {'(cache: ' + cache_dir + ')' if cache_dir else ''}...")
+    pipe = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
 
     prompt = "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
     image = pipe(prompt).images[0]

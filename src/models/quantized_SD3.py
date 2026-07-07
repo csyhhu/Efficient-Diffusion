@@ -707,13 +707,20 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # -- Model cache directory (default: HuggingFace/ModelScope default cache) --
+    cache_dir = os.environ.get("MODEL_CACHE_DIR", None)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ.setdefault("HF_HOME", cache_dir)
+        print(f"Model cache dir set to: {cache_dir}")
+
     # ---- Choose download source ----
     # SD3 is a gated model on HuggingFace (requires auth + license acceptance).
     # Default: ModelScope (no auth needed).
     # To use HuggingFace (requires HF_TOKEN):
     #   $env:DOWNLOAD_SOURCE="huggingface"
     #   $env:HF_TOKEN="hf_xxxxxxxxxxxx"
-    DOWNLOAD_SOURCE = os.environ.get("DOWNLOAD_SOURCE", "hf").lower()
+    DOWNLOAD_SOURCE = os.environ.get("DOWNLOAD_SOURCE", "modelscope").lower()
 
     from diffusers import StableDiffusion3Pipeline
 
@@ -725,8 +732,7 @@ if __name__ == "__main__":
         print(f"Downloading {model_id} via ModelScope ...")
         local_path = snapshot_download(
             model_id,
-            # cache_dir="C:/Users/Shangyu/.cache/modelscope",
-            cache_dir=".cache/modelscope",
+            cache_dir=cache_dir or ".cache/modelscope",
             allow_patterns=[
                 "**/*fp16*",             # all fp16 safetensors weights
                 "**/*.json",             # all JSON configs (model_index, config, scheduler, etc.)
@@ -781,6 +787,7 @@ if __name__ == "__main__":
             torch_dtype=torch.float16 if device == "cuda" else torch.float32,
             variant="fp16",
             token=hf_token if isinstance(hf_token, str) else True,
+            cache_dir=cache_dir,
         )
 
     # Use CPU offload to avoid OOM: keeps components on CPU,
