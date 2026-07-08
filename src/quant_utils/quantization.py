@@ -308,22 +308,27 @@ def _from_block_padded(x_deq_blocks, pad_size):
 # ============================================================================
 
 class NVFP4Quantization(torch.autograd.Function):
-    """NVFP4 4-bit floating-point quantization with two-level scaling.
+    """NVFP4 4-bit floating-point weight quantization with two-level scaling.
 
-    Quantizes the ENTIRE input tensor with a single global FP32 scale.  All
-    elements share the same s_global; only block-level (E4M3) scales vary.
+    Weight matrices ``[out_features, in_features]`` are blocked along the
+    contraction dimension (``in_features``, dim=-1). Each output channel
+    (row) is quantized independently with its own per-channel FP32 global
+    scale and per-block E4M3 block scales. This per-channel + per-in-feature-
+    block layout is designed for efficient FP4 matrix multiplication: the
+    block boundaries of weight and activation align along the contraction
+    dimension, allowing block-wise FP4 multiply-accumulate with scale
+    multiplication deferred to the end of each block.
 
     Implements the NVFP4 format introduced in NVIDIA Blackwell architecture:
     - Element format: E2M1 (1 sign, 2 exponent, 1 mantissa) = 4-bit
-    - Block size: 16 elements per scaling block
+    - Block size: block_size elements per scaling block along in_features
     - Block scale: E4M3 (1 sign, 4 exponent, 3 mantissa) = 8-bit per block
-    - Global scale: FP32 per tensor = 32-bit per tensor
+    - Global scale: FP32 per output channel = 32-bit per channel
 
     Quantization formula:
-        s_global = amax_global / (FP8_MAX × FP4_MAX)
-        s_block  = quantize_e4m3(amax_block / FP4_MAX / s_global)
-        x_fp4    = quantize_fp4(x / (s_global × s_block))
-        x_hat    = x_fp4 × s_global × s_block
+        s_global[o] = amax_global[o] / (FP8_MAX × FP4_MAX)
+        s_block[o, k] = quantize_e4m3(amax_block[o, k] / FP4_MAX / s_global[o])
+        x_fp4[o, k, :] = quantize_fp4(x[o, k, :] / (s_global[o] × s_block[o, k]))
 
     Reference:
         NVIDIA. "Quantization-Aware Distillation for NVFP4 Inference Accuracy Recovery." 2026.
@@ -331,29 +336,51 @@ class NVFP4Quantization(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x_, block_size_=16, error_info_=None, module_prefix_=None):
-        """Forward pass: quantize input tensor using NVFP4 two-level scaling.
+        """Forward pass: per-in-feature-block NVFP4 weight quantization.
 
         Args:
-            x_: input tensor of any shape.
-            block_size_: number of elements per scaling block (default: 16).
+            x_: weight matrix of shape ``[out_features, in_features]``.
+            block_size_: elements per scaling block along in_features (default: 16).
             error_info_: optional dict to store error statistics.
             module_prefix_: optional prefix for error_info_ keys.
 
         Returns:
-            dequantized output tensor with same shape as input.
+            dequantized weight tensor with same shape as input.
         """
-        orig_shape = x_.shape
+        if x_.dim() != 2:
+            raise ValueError(
+                f"NVFP4Quantization expects 2D weight [out_features, in_features], "
+                f"but got {x_.dim()}D: {x_.shape}"
+            )
 
-        # Flatten → pad → blocks
-        x_blocks, pad_size = _to_block_padded(x_.reshape(-1).float(), block_size_)
+        out_features, in_features = x_.shape
+        device = x_.device
 
-        # Core quantize (G=1: single global scale)
-        x_groups = x_blocks.unsqueeze(0)  # [1, N, block_size]
+        # Pad in_features to multiple of block_size (pad along dim=-1)
+        pad_dim = (block_size_ - in_features % block_size_) % block_size_
+        if pad_dim > 0:
+            x_pad = torch.nn.functional.pad(x_.float(), (0, pad_dim))
+        else:
+            x_pad = x_.float()
+        in_features_padded = in_features + pad_dim
+        num_blocks = in_features_padded // block_size_
+
+        # [out_features, num_blocks, block_size]  →  G = out_features
+        x_groups = x_pad.reshape(out_features, num_blocks, block_size_)
+
         x_deq_groups, s_global, _ = _nvfp4_quantize_core(x_groups, block_size_)
-        x_deq_blocks = x_deq_groups.squeeze(0)  # [N, block_size]
 
-        # Remove padding → restore shape
-        x_deq = _from_block_padded(x_deq_blocks, pad_size).reshape(orig_shape)
+        # Reshape back: [out_features, num_blocks, block_size] → [out_features, in_features_padded]
+        x_deq_pad = x_deq_groups.reshape(out_features, in_features_padded)
+
+        # Remove padding
+        if pad_dim > 0:
+            x_deq = x_deq_pad[:, :in_features]
+        else:
+            x_deq = x_deq_pad
+
+        # Cast back to original dtype
+        x_deq = x_deq.to(x_.dtype)
 
         # Store for backward
         ctx.save_for_backward(x_)
@@ -366,7 +393,7 @@ class NVFP4Quantization(torch.autograd.Function):
             quantization_error = (x_ - x_deq).float()
             error_info_[f"{prefix}nvfp4_error_mse"] = (quantization_error ** 2).mean().item()
             error_info_[f"{prefix}nvfp4_error_mae"] = quantization_error.abs().mean().item()
-            error_info_[f"{prefix}nvfp4_s_global"] = s_global.squeeze().item()
+            error_info_[f"{prefix}nvfp4_s_global_mean"] = s_global.mean().item()
 
         return x_deq
 
@@ -387,30 +414,36 @@ class NVFP4Quantization(torch.autograd.Function):
 class NVFP4ActivationQuantization(torch.autograd.Function):
     """NVFP4 activation quantization with per-token (token-wise) two-level scaling.
 
-    For input of shape [bs, n_seq, dim], each token (a slice along the last
-    dimension) is quantized independently with its own FP32 global scale and
-    per-block E4M3 scales.  This provides finer-grained dynamic range adaptation
-    compared to sharing a single global scale across all tokens.
+    For input of shape ``[bs, n_seq, dim]``, each token is quantized
+    independently along the feature dimension (``dim``, last axis) with its
+    own FP32 global scale and per-block E4M3 scales. The blocking direction
+    matches ``NVFP4Quantization`` (both block along the contraction / feature
+    dimension), enabling efficient FP4 matrix multiplication where block
+    boundaries align between weight and activation.
 
-    This differs from NVFP4Quantization in that:
-        - NVFP4Quantization: one s_global for the ENTIRE tensor.
-        - NVFP4ActivationQuantization: one s_global PER TOKEN (bs × n_seq).
+    Scale layout:
+        - s_global[tok]: FP32, one per token
+        - s_block[tok, block_k]: E4M3, one per block per token
+        - x_fp4[tok, block_k, :]: FP4 (E2M1) data elements
 
-    Uses the same E2M1 / E4M3 / FP32 two-level scaling as NVFP4Quantization.
+    This differs from NVFP4Quantization (weight) in that:
+        - NVFP4Quantization: one s_global PER OUTPUT CHANNEL.
+        - NVFP4ActivationQuantization: one s_global PER TOKEN.
     """
 
     @staticmethod
     def forward(ctx, x_, block_size_=16, error_info_=None, module_prefix_=None):
-        """Forward pass: token-wise NVFP4 quantization.
+        """Forward pass: per-token per-in-feature-block NVFP4 activation quantization.
 
         Args:
-            x_: input tensor of shape [bs, n_seq, dim].
-            block_size_: elements per scaling block (default: 16).
+            x_: input tensor of shape ``[bs, n_seq, dim]``.
+            block_size_: elements per scaling block along the feature dim
+                (default: 16).
             error_info_: optional dict to store error statistics.
             module_prefix_: optional prefix for error_info_ keys.
 
         Returns:
-            dequantized tensor with shape [bs, n_seq, dim].
+            dequantized tensor with shape ``[bs, n_seq, dim]``.
         """
         if x_.dim() != 3:
             raise ValueError(
@@ -436,7 +469,7 @@ class NVFP4ActivationQuantization(torch.autograd.Function):
 
         x_groups = x_pad.reshape(num_tokens, num_blocks, block_size_)  # [G, N, B]
 
-        # Core quantize (G = num_tokens: one global scale per token)
+        # Core quantize: G = num_tokens, each token has its own global + block scales
         x_deq_groups, s_global, _ = _nvfp4_quantize_core(x_groups, block_size_)
 
         # Reshape back: [num_tokens, num_blocks, block_size] → [num_tokens, dim_padded]
