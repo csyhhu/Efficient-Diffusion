@@ -4,12 +4,12 @@ import torch.nn.functional as F
 
 # supports both package import and direct script execution
 try:
-    from ..quant_utils.quantization import AsymmetricQuantization
+    from ..quant_utils.quantization import AsymmetricQuantization, NVFP4Quantization
 except ImportError:
     import sys, os
     _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, _src)
-    from quant_utils.quantization import AsymmetricQuantization
+    from quant_utils.quantization import AsymmetricQuantization, NVFP4Quantization
 
 
 class QuantizedMultiHeadAttention(nn.MultiheadAttention):
@@ -263,6 +263,195 @@ class QuantizedMultiHeadAttention(nn.MultiheadAttention):
             return attn_output, attn_weights_for_return
         else:
             return (attn_output,)
+
+
+class NVFP4MultiHeadAttention(nn.MultiheadAttention):
+    """Multi-head attention with NVFP4 quantization and optional rotation/
+    permutation on the contraction dim.
+
+    The in_proj (Q/K/V) share ONE rotation (data-free or learned) and ONE
+    in_proj permutation, because their input activation is the same tensor x:
+    giving each branch a different transform would make the (lossless) folding
+    impossible. Each branch's weight is transformed by the same T_in, and x is
+    transformed once. The out_proj uses the same shared rotation but its own
+    out_proj permutation. All transforms cancel mathematically before
+    quantization, so the un-quantized output equals the original MHA.
+
+    Args:
+        rotation:         RotationBase shared by in_proj and out_proj, or None.
+        in_permutation:   PermutationBase for the in_proj (shared by Q/K/V), or None.
+        out_permutation:  PermutationBase for the out_proj, or None.
+        quantize:         if False, no NVFP4 quantization is applied (consistency test).
+        block_size:       NVFP4 block size (default 16).
+    """
+
+    def __init__(self, *args, block_size=16, rotation=None, in_permutation=None,
+                 out_permutation=None, quantize=True, layer_prefix=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_size = block_size
+        self.rotation = rotation
+        self.in_permutation = in_permutation
+        self.out_permutation = out_permutation
+        self.quantize = quantize
+        self.layer_prefix = layer_prefix
+
+        # Fit each permutation on the ROTATED weight of its own projection, so a
+        # magnitude-based sort groups the final (to-be-quantized) columns.
+        # Order is always: rotation first, then permutation (see _tw / _ta).
+        if self.in_permutation is not None:
+            in_w = self.rotation.rotate_weight(self.in_proj_weight.data) if self.rotation is not None else self.in_proj_weight.data
+            self.in_permutation.fit(in_w)
+        if self.out_permutation is not None:
+            out_w = self.rotation.rotate_weight(self.out_proj.weight.data) if self.rotation is not None else self.out_proj.weight.data
+            self.out_permutation.fit(out_w)
+
+    def _tw(self, W, rotation, perm):
+        """Transform a weight on the contraction dim: rotation first, then permutation."""
+        Wt = W
+        if rotation is not None:
+            Wt = rotation.rotate_weight(Wt)
+        if perm is not None:
+            Wt = perm.transform_weight(Wt)
+        return Wt
+
+    def _ta(self, x, rotation, perm):
+        """Transform an activation on the contraction dim: rotation first, then permutation."""
+        xt = x
+        if rotation is not None:
+            xt = rotation.rotate_activation(xt)
+        if perm is not None:
+            xt = perm.transform_activation(xt)
+        return xt
+
+    def _q(self, W):
+        if self.quantize:
+            return NVFP4Quantization.apply(W, self.block_size)
+        return W
+
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=True,
+                attn_mask=None, average_attn_weights=True, is_causal=False):
+        # ---- batch_first handling -> canonical [seq, batch, embed] ----
+        is_batched = query.dim() == 3
+        if self.batch_first and is_batched:
+            if key is value:
+                if query is key:
+                    query = key = value = query.transpose(1, 0)
+                else:
+                    query, key = (x.transpose(1, 0) for x in (query, key))
+                    value = key
+            else:
+                query, key, value = (x.transpose(1, 0) for x in (query, key, value))
+
+        # ---- transform the shared input ONCE (in_proj rotation + permutation) ----
+        query_t = self._ta(query, self.rotation, self.in_permutation)
+        key_t = self._ta(key, self.rotation, self.in_permutation)
+        value_t = self._ta(value, self.rotation, self.in_permutation)
+
+        embed_dim = self.embed_dim
+        num_heads = self.num_heads
+        head_dim = embed_dim // num_heads
+
+        q_weight, k_weight, v_weight = self.in_proj_weight.split(embed_dim, dim=0)
+        q_weight_t = self._q(self._tw(q_weight, self.rotation, self.in_permutation))
+        k_weight_t = self._q(self._tw(k_weight, self.rotation, self.in_permutation))
+        v_weight_t = self._q(self._tw(v_weight, self.rotation, self.in_permutation))
+
+        q_bias = k_bias = v_bias = None
+        if self.in_proj_bias is not None:
+            q_bias, k_bias, v_bias = self.in_proj_bias.split(embed_dim, dim=0)
+
+        q = F.linear(query_t, q_weight_t, q_bias)
+        k = F.linear(key_t, k_weight_t, k_bias)
+        v = F.linear(value_t, v_weight_t, v_bias)
+
+        tgt_len, bsz = q.shape[0], q.shape[1]
+        src_len = k.shape[0]
+
+        q = q.view(tgt_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        k = k.view(src_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        v = v.view(src_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+
+        # ---- add_bias_kv (optional learned bias appended to K/V) ----
+        bias_k = self.bias_k if hasattr(self, 'bias_k') and self.bias_k is not None else None
+        bias_v = self.bias_v if hasattr(self, 'bias_v') and self.bias_v is not None else None
+        if bias_k is not None and bias_v is not None:
+            if bias_k.dim() == 5:
+                bias_k = bias_k.reshape(1, num_heads, 1, head_dim).expand(bsz, -1, 1, -1)
+                bias_v = bias_v.reshape(1, num_heads, 1, head_dim).expand(bsz, -1, 1, -1)
+            elif bias_k.dim() == 3:
+                bias_k = bias_k.unsqueeze(0).expand(bsz, -1, -1, -1)
+                bias_v = bias_v.unsqueeze(0).expand(bsz, -1, -1, -1)
+            k = torch.cat([k, bias_k], dim=2)
+            v = torch.cat([v, bias_v], dim=2)
+            src_len = src_len + 1
+            if attn_mask is not None:
+                if attn_mask.dim() == 2:
+                    attn_mask = F.pad(attn_mask, (0, 1))
+                elif attn_mask.dim() == 3:
+                    attn_mask = F.pad(attn_mask, (0, 1))
+                elif attn_mask.dim() == 4:
+                    attn_mask = F.pad(attn_mask, (0, 1))
+            if key_padding_mask is not None:
+                key_padding_mask = F.pad(key_padding_mask, (0, 1))
+
+        # ---- add_zero_attn ----
+        if self.add_zero_attn:
+            zero_attn = torch.zeros(bsz, num_heads, 1, head_dim,
+                                    dtype=k.dtype, device=k.device)
+            k = torch.cat([k, zero_attn], dim=2)
+            v = torch.cat([v, zero_attn], dim=2)
+            src_len = src_len + 1
+            if attn_mask is not None:
+                if attn_mask.dim() == 2:
+                    attn_mask = F.pad(attn_mask, (0, 1))
+                elif attn_mask.dim() == 3:
+                    attn_mask = F.pad(attn_mask, (0, 1))
+                elif attn_mask.dim() == 4:
+                    attn_mask = F.pad(attn_mask, (0, 1))
+            if key_padding_mask is not None:
+                key_padding_mask = F.pad(key_padding_mask, (0, 1))
+
+        # ---- merge key_padding_mask into attn_mask ----
+        if key_padding_mask is not None:
+            kpm = torch.zeros(bsz, 1, 1, src_len, dtype=q.dtype, device=q.device)
+            kpm.masked_fill_(key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            attn_mask = kpm if attn_mask is None else attn_mask + kpm
+
+        # ---- attention computation ----
+        dropout_p = self.dropout if self.training else 0.0
+        if need_weights:
+            scale = head_dim ** -0.5
+            attn_weights_out = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if attn_mask is not None:
+                attn_weights_out = attn_weights_out + attn_mask
+            if is_causal:
+                causal_mask = torch.triu(
+                    torch.ones(tgt_len, src_len, device=q.device, dtype=torch.bool), diagonal=1)
+                attn_weights_out.masked_fill_(causal_mask, float('-inf'))
+            attn_weights_out = F.softmax(attn_weights_out, dim=-1)
+            if dropout_p > 0:
+                attn_weights_out = F.dropout(attn_weights_out, p=dropout_p, training=self.training)
+            attn_output = torch.matmul(attn_weights_out, v)
+            if average_attn_weights:
+                attn_weights_for_return = attn_weights_out.detach().mean(dim=1)
+            else:
+                attn_weights_for_return = attn_weights_out.detach()
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+            attn_weights_for_return = None
+
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(tgt_len, bsz, embed_dim)
+
+        # ---- out_proj (shared rotation + dedicated out_permutation) ----
+        attn_output_t = self._ta(attn_output, self.rotation, self.out_permutation)
+        out_weight_t = self._q(self._tw(self.out_proj.weight, self.rotation, self.out_permutation))
+        attn_output = F.linear(attn_output_t, out_weight_t, self.out_proj.bias)
+
+        if self.batch_first and is_batched:
+            attn_output = attn_output.transpose(1, 0)
+
+        return attn_output, attn_weights_for_return
 
 
 if __name__ == "__main__":

@@ -393,7 +393,15 @@ class NVFP4Quantization(torch.autograd.Function):
             quantization_error = (x_ - x_deq).float()
             error_info_[f"{prefix}nvfp4_error_mse"] = (quantization_error ** 2).mean().item()
             error_info_[f"{prefix}nvfp4_error_mae"] = quantization_error.abs().mean().item()
-            error_info_[f"{prefix}nvfp4_s_global_mean"] = s_global.mean().item()
+            if error_info_.get("_cosine"):
+                # compute in original dtype to avoid float32 copy; only
+                # cast the final scalar division to fp32 for safety.
+                dot = (x_ * x_deq).sum()
+                nx = x_.norm()
+                nd = x_deq.norm()
+                error_info_[f"{prefix}nvfp4_error_cosine"] = (
+                    dot.float() / (nx.float() * nd.float() + 1e-12)).item()
+            # error_info_[f"{prefix}nvfp4_s_global_mean"] = s_global.mean().item()
 
         return x_deq
 
@@ -495,6 +503,14 @@ class NVFP4ActivationQuantization(torch.autograd.Function):
             quantization_error = (x_ - x_deq).float()
             error_info_[f"{prefix}nvfp4_act_error_mse"] = (quantization_error ** 2).mean().item()
             error_info_[f"{prefix}nvfp4_act_error_mae"] = quantization_error.abs().mean().item()
+            if error_info_.get("_cosine"):
+                # compute in original dtype to avoid float32 copy; only
+                # cast the final scalar division to fp32 for safety.
+                dot = (x_ * x_deq).sum()
+                nx = x_.norm()
+                nd = x_deq.norm()
+                error_info_[f"{prefix}nvfp4_act_error_cosine"] = (
+                    dot.float() / (nx.float() * nd.float() + 1e-12)).item()
 
         return x_deq
 

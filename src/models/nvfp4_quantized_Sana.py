@@ -26,6 +26,22 @@ Usage::
         "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
         block_size=16,
     )
+
+    # NVFP4 + Hadamard rotation + magnitude-sort permutation (each layer gets
+    # its own permutation, fitted on the real weights after from_pretrained):
+    model = NVFP4QuantizedSana.from_pretrained(
+        "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+        block_size=16,
+        rotation="hadamard",     # "none" | "hadamard" | "random" | "cayley" | RotationBase
+        permutation="mag",       # "none" | "identity" | "random" | "mag" | PermutationBase
+    )
+
+    # Or pass instances directly for full control (e.g. a pre-fitted Cayley):
+    from src.quant_utils.rotation import HadamardRotation
+    from src.quant_utils.permutation import MagnitudeSortPermutation
+    model = NVFP4QuantizedSana.from_pretrained(
+        "...", rotation=HadamardRotation(block_size=16),
+        permutation=MagnitudeSortPermutation(block_size=16))
 """
 
 import math
@@ -40,12 +56,68 @@ import torch.nn.functional as F
 
 # supports both package import and direct script execution
 try:
-    from ..quant_utils.quantization import NVFP4Quantization, NVFP4ActivationQuantization
+    from ..modules.quantized_linear import NVFP4Linear
 except ImportError:
     import sys
     _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, _src)
-    from quant_utils.quantization import NVFP4Quantization, NVFP4ActivationQuantization
+    from modules.quantized_linear import NVFP4Linear
+
+try:
+    from ..quant_utils.rotation import (
+        RotationBase, IdentityRotation, HadamardRotation, RandomRotation, CayleyRotation)
+    from ..quant_utils.permutation import (
+        PermutationBase, IdentityPermutation, RandomPermutation,
+        MagnitudeSortPermutation)
+except ImportError:
+    from quant_utils.rotation import (
+        RotationBase, IdentityRotation, HadamardRotation, RandomRotation, CayleyRotation)
+    from quant_utils.permutation import (
+        PermutationBase, IdentityPermutation, RandomPermutation,
+        MagnitudeSortPermutation)
+
+import copy
+
+
+def make_rotation(name, block_size=16, seed=None):
+    """Build a rotation instance from a name / instance / None.
+
+    A single (shared) rotation instance can be reused across all layers
+    because ``RotationBase`` caches its matrix per ``(n, device, dtype)``.
+    """
+    if name is None or name == "none":
+        return IdentityRotation(block_size=block_size)
+    if isinstance(name, RotationBase):
+        return name
+    if name == "hadamard":
+        return HadamardRotation(block_size=block_size)
+    if name == "random":
+        return RandomRotation(block_size=block_size, seed=seed)
+    if name == "cayley":
+        # learnable: caller must .fit() on calibration weights before use
+        return CayleyRotation(block_size=block_size, seed=seed)
+    raise ValueError(f"unknown rotation: {name}")
+
+
+def make_permutation(name, block_size=16, seed=None):
+    """Build a PER-LAYER permutation FACTORY from a name / instance / None.
+
+    Returns a callable ``factory(in_features) -> PermutationBase | None``.
+    A fresh permutation instance is created for every layer (permutations are
+    layer-specific and must NOT be shared), and is later fitted on that
+    layer's real weight via ``NVFP4Linear.fit_permutation``.
+    """
+    if name is None or name == "none":
+        return lambda in_features: IdentityPermutation(block_size=block_size)
+    if isinstance(name, PermutationBase):
+        return lambda in_features: copy.deepcopy(name)
+    if name == "identity":
+        return lambda in_features: IdentityPermutation(block_size=block_size)
+    if name == "random":
+        return lambda in_features: RandomPermutation(block_size=block_size, seed=seed)
+    if name == "mag":
+        return lambda in_features: MagnitudeSortPermutation(block_size=block_size)
+    raise ValueError(f"unknown permutation: {name}")
 
 
 # ===========================================================================
@@ -100,77 +172,26 @@ def _get_2d_sincos(embed_dim: int, h: int, w: int,
 
 
 # ===========================================================================
-# NVFP4 Linear layers
+# NVFP4 Linear layers (reuse src.modules.quantized_linear.NVFP4Linear)
 # ===========================================================================
 
-class NVFP4Linear(nn.Module):
-    """Linear layer with NVFP4 weight (per-in-feature-block) and optional
-    activation (per-token per-in-feature-block) quantization.
-
-    Both weight and activation are blocked along the contraction (in_features)
-    dimension so that block boundaries align for efficient FP4 matrix
-    multiplication.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        block_size: int = 16,
-        quantize_activation: bool = False,
-        layer_prefix: str = None,
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.block_size = block_size
-        self.quantize_activation = quantize_activation
-        self.layer_prefix = layer_prefix
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, x: torch.Tensor, quantization_error_info: dict = None) -> torch.Tensor:
-        w_q = NVFP4Quantization.apply(
-            self.weight, self.block_size,
-            quantization_error_info,
-            f"{self.layer_prefix}.weight" if self.layer_prefix else "weight",
-        ).to(x.dtype)
-        if self.quantize_activation and x.dim() == 3:
-            x = NVFP4ActivationQuantization.apply(
-                x, self.block_size,
-                quantization_error_info,
-                f"{self.layer_prefix}.act" if self.layer_prefix else "act",
-            ).to(x.dtype)
-        return F.linear(x, w_q, self.bias)
-
-
-class UnquantizedLinear(nn.Linear):
-    """Plain ``nn.Linear`` with NVFP4-compatible forward signature."""
-
-    def forward(self, x: torch.Tensor, quantization_error_info: dict = None) -> torch.Tensor:
-        return super().forward(x)
-
-
 def _make_linear(in_features: int, out_features: int, bias: bool = True,
-                 block_size: int = 16, quantize_activation: bool = False,
-                 layer_prefix: str = None, use_nvfp4: bool = True) -> nn.Module:
-    """Factory: returns ``NVFP4Linear`` or ``UnquantizedLinear`` based on flag."""
-    if use_nvfp4:
-        return NVFP4Linear(in_features, out_features, bias=bias,
-                           block_size=block_size,
-                           quantize_activation=quantize_activation,
-                           layer_prefix=layer_prefix)
-    else:
-        return UnquantizedLinear(in_features, out_features, bias=bias)
+                 block_size: int = 16, layer_prefix: str = None,
+                 use_nvfp4: bool = True, rotation=None,
+                 permutation=None) -> nn.Module:
+    """Factory: returns an ``NVFP4Linear`` with ``quantize=use_nvfp4``.
+
+    ``rotation`` is a (shared) ``RotationBase`` instance or None. ``permutation``
+    is a per-layer factory ``(in_features) -> PermutationBase | None`` (as
+    produced by ``make_permutation``) — a fresh permutation is created for this
+    layer so they are not shared across layers.
+    """
+    perm = permutation(in_features) if callable(permutation) else permutation
+    return NVFP4Linear(
+        in_features, out_features, bias=bias, block_size=block_size,
+        rotation=rotation, permutation=perm,
+        layer_prefix=layer_prefix, quantize=use_nvfp4,
+    )
 
 
 # ===========================================================================
@@ -202,6 +223,8 @@ class NVFP4Attention(nn.Module):
         block_size: int = 16,
         layer_prefix: str = None,
         use_nvfp4: bool = True,
+        rotation=None,
+        permutation=None,
     ):
         super().__init__()
         self.inner_dim = dim_head * heads
@@ -216,15 +239,18 @@ class NVFP4Attention(nn.Module):
         self.to_q = _make_linear(query_dim, self.inner_dim, bias=bias,
                                  block_size=block_size,
                                  layer_prefix=f"{layer_prefix}.to_q",
-                                 use_nvfp4=use_nvfp4)
+                                 use_nvfp4=use_nvfp4,
+                                 rotation=rotation, permutation=permutation)
         self.to_k = _make_linear(kv_input_dim, self.inner_dim, bias=bias,
                                  block_size=block_size,
                                  layer_prefix=f"{layer_prefix}.to_k",
-                                 use_nvfp4=use_nvfp4)
+                                 use_nvfp4=use_nvfp4,
+                                 rotation=rotation, permutation=permutation)
         self.to_v = _make_linear(kv_input_dim, self.inner_dim, bias=bias,
                                  block_size=block_size,
                                  layer_prefix=f"{layer_prefix}.to_v",
-                                 use_nvfp4=use_nvfp4)
+                                 use_nvfp4=use_nvfp4,
+                                 rotation=rotation, permutation=permutation)
 
         # QK norm (None for Sana Sprint 0.6B)
         self.norm_q = None
@@ -241,7 +267,8 @@ class NVFP4Attention(nn.Module):
             _make_linear(self.inner_dim, query_dim, bias=out_bias,
                          block_size=block_size,
                          layer_prefix=f"{layer_prefix}.to_out.0",
-                         use_nvfp4=use_nvfp4),
+                         use_nvfp4=use_nvfp4,
+                         rotation=rotation, permutation=permutation),
             nn.Dropout(dropout),
         ])
 
@@ -406,19 +433,22 @@ class TimestepEmbedding(nn.Module):
                  out_dim: Optional[int] = None,
                  block_size: int = 16,
                  layer_prefix: str = None,
-                 use_nvfp4: bool = True):
+                 use_nvfp4: bool = True,
+                 rotation=None, permutation=None):
         super().__init__()
         self.layer_prefix = layer_prefix
         self.linear_1 = _make_linear(in_channels, time_embed_dim, bias=True,
                                      block_size=block_size,
                                      layer_prefix=f"{layer_prefix}.linear_1",
-                                     use_nvfp4=use_nvfp4)
+                                     use_nvfp4=use_nvfp4,
+                                     rotation=rotation, permutation=permutation)
         self.act = nn.SiLU()
         out_dim = out_dim or time_embed_dim
         self.linear_2 = _make_linear(time_embed_dim, out_dim, bias=True,
                                      block_size=block_size,
                                      layer_prefix=f"{layer_prefix}.linear_2",
-                                     use_nvfp4=use_nvfp4)
+                                     use_nvfp4=use_nvfp4,
+                                     rotation=rotation, permutation=permutation)
 
     def forward(self, sample: torch.Tensor,
                 quantization_error_info: dict = None) -> torch.Tensor:
@@ -476,18 +506,21 @@ class PixArtAlphaTextProjection(nn.Module):
     def __init__(self, in_features: int, hidden_size: int,
                  block_size: int = 16,
                  layer_prefix: str = None,
-                 use_nvfp4: bool = True):
+                 use_nvfp4: bool = True,
+                 rotation=None, permutation=None):
         super().__init__()
         self.layer_prefix = layer_prefix
         self.linear_1 = _make_linear(in_features, hidden_size, bias=True,
                                      block_size=block_size,
                                      layer_prefix=f"{layer_prefix}.linear_1",
-                                     use_nvfp4=use_nvfp4)
+                                     use_nvfp4=use_nvfp4,
+                                     rotation=rotation, permutation=permutation)
         self.act_1 = nn.GELU(approximate="tanh")  # <- this is the correct activation
         self.linear_2 = _make_linear(hidden_size, hidden_size, bias=True,
                                      block_size=block_size,
                                      layer_prefix=f"{layer_prefix}.linear_2",
-                                     use_nvfp4=use_nvfp4)
+                                     use_nvfp4=use_nvfp4,
+                                     rotation=rotation, permutation=permutation)
 
     def forward(self, caption: torch.Tensor,
                 quantization_error_info: dict = None) -> torch.Tensor:
@@ -569,7 +602,8 @@ class SanaCombinedTimestepGuidanceEmbeddings(nn.Module):
     """
 
     def __init__(self, embedding_dim: int, block_size: int = 16,
-                 layer_prefix: str = None, use_nvfp4: bool = True):
+                 layer_prefix: str = None, use_nvfp4: bool = True,
+                 rotation=None, permutation=None):
         super().__init__()
         self.layer_prefix = layer_prefix
 
@@ -579,7 +613,8 @@ class SanaCombinedTimestepGuidanceEmbeddings(nn.Module):
             in_channels=256, time_embed_dim=embedding_dim,
             block_size=block_size,
             layer_prefix=f"{layer_prefix}.timestep_embedder",
-            use_nvfp4=use_nvfp4)
+            use_nvfp4=use_nvfp4,
+            rotation=rotation, permutation=permutation)
         self.guidance_condition_proj = Timesteps(num_channels=256,
                                                   flip_sin_to_cos=True,
                                                   downscale_freq_shift=0)
@@ -587,13 +622,15 @@ class SanaCombinedTimestepGuidanceEmbeddings(nn.Module):
             in_channels=256, time_embed_dim=embedding_dim,
             block_size=block_size,
             layer_prefix=f"{layer_prefix}.guidance_embedder",
-            use_nvfp4=use_nvfp4)
+            use_nvfp4=use_nvfp4,
+            rotation=rotation, permutation=permutation)
 
         self.silu = nn.SiLU()
         self.linear = _make_linear(embedding_dim, 6 * embedding_dim, bias=True,
                                    block_size=block_size,
                                    layer_prefix=f"{layer_prefix}.linear",
-                                   use_nvfp4=use_nvfp4)
+                                   use_nvfp4=use_nvfp4,
+                                   rotation=rotation, permutation=permutation)
 
     def forward(self, timestep: torch.Tensor,
                 guidance: torch.Tensor = None,
@@ -633,7 +670,8 @@ class SanaTransformerBlock(nn.Module):
                  qk_norm: Optional[str] = None,
                  block_size: int = 16,
                  layer_prefix: str = None,
-                 use_nvfp4: bool = True):
+                 use_nvfp4: bool = True,
+                 rotation=None, permutation=None):
         super().__init__()
         self.layer_prefix = layer_prefix
 
@@ -653,6 +691,7 @@ class SanaTransformerBlock(nn.Module):
             block_size=block_size,
             layer_prefix=f"{layer_prefix}.attn1",
             use_nvfp4=use_nvfp4,
+            rotation=rotation, permutation=permutation,
         )
 
         # Cross-attention (SDPA)
@@ -671,6 +710,7 @@ class SanaTransformerBlock(nn.Module):
             block_size=block_size,
             layer_prefix=f"{layer_prefix}.attn2",
             use_nvfp4=use_nvfp4,
+            rotation=rotation, permutation=permutation,
         )
 
         # FF — GLUMBConv
@@ -768,6 +808,8 @@ class NVFP4QuantizedSana(nn.Module):
         qk_norm: Optional[str] = None,
         block_size: int = 16,
         use_nvfp4: bool = True,
+        rotation=None,
+        permutation=None,
     ):
         super().__init__()
         out_channels = out_channels or in_channels
@@ -778,6 +820,16 @@ class NVFP4QuantizedSana(nn.Module):
         self.num_layers = num_layers
         self.block_size = block_size
         self.use_nvfp4 = use_nvfp4
+
+        # ---- rotation / permutation ----
+        # rotation: shared RotationBase instance or None (caches per dim).
+        # permutation: normalized into a per-layer factory so each NVFP4Linear
+        # gets its OWN permutation, fitted on its real weight after copy.
+        self.rotation = (rotation if isinstance(rotation, (RotationBase, type(None)))
+                         else make_rotation(rotation, block_size))
+        self.permutation_factory = (
+            permutation if callable(permutation)
+            else make_permutation(permutation, block_size))
 
         # Pipeline-compatible config namespace
         self.config = SimpleNamespace(
@@ -801,6 +853,8 @@ class NVFP4QuantizedSana(nn.Module):
                 block_size=block_size,
                 layer_prefix="time_embed",
                 use_nvfp4=use_nvfp4,
+                rotation=self.rotation,
+                permutation=self.permutation_factory,
             )
         else:
             raise NotImplementedError("Only guidance_embeds=True is supported")
@@ -811,6 +865,8 @@ class NVFP4QuantizedSana(nn.Module):
             block_size=block_size,
             layer_prefix="caption_projection",
             use_nvfp4=use_nvfp4,
+            rotation=self.rotation,
+            permutation=self.permutation_factory,
         )
         self.caption_norm = nn.RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
 
@@ -832,6 +888,8 @@ class NVFP4QuantizedSana(nn.Module):
                 block_size=block_size,
                 layer_prefix=f"block.{i}",
                 use_nvfp4=use_nvfp4,
+                rotation=self.rotation,
+                permutation=self.permutation_factory,
             )
             for i in range(num_layers)
         ])
@@ -844,12 +902,22 @@ class NVFP4QuantizedSana(nn.Module):
         self.proj_out = _make_linear(
             inner_dim, patch_size * patch_size * out_channels,
             bias=True, block_size=block_size, layer_prefix="proj_out",
-            use_nvfp4=use_nvfp4)
+            use_nvfp4=use_nvfp4,
+            rotation=self.rotation,
+            permutation=self.permutation_factory)
 
         self.gradient_checkpointing = False
         self.quantization_error_info: dict = {}
+        # Fit permutations on the (current) weights; for from_pretrained this is
+        # redone after _copy_weights loads the real weights.
+        self.fit_all_permutations()
         mode = "NVFP4" if use_nvfp4 else "unquantized"
-        print(f"Initialize Sana Transformer ({mode} mode, block_size={block_size})")
+        rot_name = type(self.rotation).__name__ if self.rotation is not None else "none"
+        perm_name = (permutation if isinstance(permutation, str)
+                     else type(self.permutation_factory(16)).__name__
+                     if self.permutation_factory(16) is not None else "none")
+        print(f"Initialize Sana Transformer ({mode} mode, block_size={block_size}, "
+              f"rotation={rot_name}, permutation={perm_name})")
 
     @property
     def dtype(self) -> torch.dtype:
@@ -857,6 +925,21 @@ class NVFP4QuantizedSana(nn.Module):
             return next(self.parameters()).dtype
         except StopIteration:
             return torch.float32
+
+    # ------------------------------------------------------------------
+    # Permutation fitting
+    # ------------------------------------------------------------------
+
+    def fit_all_permutations(self):
+        """Fit every layer's permutation on the CURRENT (real) weights.
+
+        Call this after weights are loaded (e.g. ``from_pretrained`` or
+        ``_copy_weights``). Rotations are data-free (or pre-fitted by the
+        caller) and need no action here.
+        """
+        for m in self.modules():
+            if isinstance(m, NVFP4Linear):
+                m.fit_permutation()
 
     # ------------------------------------------------------------------
     # from_pretrained
@@ -867,17 +950,35 @@ class NVFP4QuantizedSana(nn.Module):
                                  download_source: str = "modelscope",
                                  cache_dir: str = None,
                                  **kwargs):
-        """Download (if needed) and return local checkpoint directory."""
+        """Return a local checkpoint directory, using the cache first and only downloading when needed."""
         if os.path.isdir(pretrained_model_name_or_path):
             return pretrained_model_name_or_path
+
+        if cache_dir:
+            candidate = os.path.join(cache_dir, pretrained_model_name_or_path.replace("/", os.sep))
+            if os.path.isdir(candidate):
+                print(f"  Using local cache directory: {candidate}")
+                return candidate
+
         if download_source == "modelscope":
-            from modelscope import snapshot_download
-            local_path = snapshot_download(
-                pretrained_model_name_or_path,
-                cache_dir=cache_dir or ".cache/modelscope",
-            )
-            print(f"  ModelScope cache: {local_path}")
-            return local_path
+            try:
+                from modelscope import snapshot_download
+                local_path = snapshot_download(
+                    pretrained_model_name_or_path,
+                    cache_dir=cache_dir or ".cache/modelscope",
+                    local_files_only=True,
+                )
+                print(f"  ModelScope cache: {local_path}")
+                return local_path
+            except Exception as exc:
+                print(f"  Local ModelScope cache not found; attempting download: {exc}")
+                from modelscope import snapshot_download
+                local_path = snapshot_download(
+                    pretrained_model_name_or_path,
+                    cache_dir=cache_dir or ".cache/modelscope",
+                )
+                print(f"  ModelScope download: {local_path}")
+                return local_path
         else:
             from huggingface_hub import snapshot_download as hf_snapshot_download
             hf_kwargs = {"local_files_only": True}
@@ -900,6 +1001,8 @@ class NVFP4QuantizedSana(nn.Module):
                         cache_dir: str = None,
                         block_size: int = 16,
                         use_nvfp4: bool = True,
+                        rotation=None,
+                        permutation=None,
                         **kwargs):
         """Build NVFP4QuantizedSana / unquantized Sana from a pretrained checkpoint."""
         from diffusers import SanaTransformer2DModel
@@ -952,6 +1055,8 @@ class NVFP4QuantizedSana(nn.Module):
             qk_norm=cfg.get("qk_norm", None),
             block_size=block_size,
             use_nvfp4=use_nvfp4,
+            rotation=rotation,
+            permutation=permutation,
         )
 
         # Step 4: load reference model & copy weights
@@ -960,6 +1065,16 @@ class NVFP4QuantizedSana(nn.Module):
         )
         model._copy_weights(ref)
         del ref
+
+        # Step 5: fit per-layer permutations on the real weights
+        model.fit_all_permutations()
+
+        # If a learnable (Cayley) rotation was requested, it must be fitted on
+        # calibration data by the caller BEFORE construction; here we just
+        # invalidate any cached matrix so it is rebuilt on the correct device.
+        if model.rotation is not None:
+            model.rotation.invalidate()
+
         return model
 
     # ------------------------------------------------------------------
@@ -1102,10 +1217,10 @@ class NVFP4QuantizedSana(nn.Module):
         batch_size, num_channels, height, width = hidden_states.shape
         p = self.patch_size
         post_patch_height, post_patch_width = height // p, width // p
-
         hidden_states = self.patch_embed(hidden_states)
 
         # Timestep + guidance embedding
+        # print(timestep.dtype, guidance.dtype) # torch.bfloat16 torch.bfloat16
         if guidance is not None:
             timestep_emb, embedded_timestep = self.time_embed(
                 timestep, guidance=guidance, hidden_dtype=hidden_states.dtype,
@@ -1113,14 +1228,15 @@ class NVFP4QuantizedSana(nn.Module):
             )
         else:
             timestep_emb, embedded_timestep = self.time_embed(
-                timestep, guidance=torch.zeros_like(timestep),
+                timestep, guidance=torch.zeros_like(timestep).type(hidden_states.dtype),
                 hidden_dtype=hidden_states.dtype,
                 quantization_error_info=quantization_error_info,
             )
 
         # Text projection + reshape (matches diffusers exactly)
         encoder_hidden_states = self.caption_projection(
-            encoder_hidden_states, quantization_error_info)
+            encoder_hidden_states.to(dtype=hidden_states.dtype),
+            quantization_error_info)
         encoder_hidden_states = encoder_hidden_states.view(
             batch_size, -1, hidden_states.shape[-1])
         encoder_hidden_states = self.caption_norm(encoder_hidden_states)
@@ -1184,7 +1300,7 @@ if __name__ == "__main__":
     download_source = os.environ.get("DOWNLOAD_SOURCE", "modelscope").lower()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    os.environ["MODEL_CACHE_DIR"] = ".cache/modelscope"
+    os.environ["MODEL_CACHE_DIR"] = "G://models"
     cache_dir = os.environ.get("MODEL_CACHE_DIR", None)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -1194,7 +1310,7 @@ if __name__ == "__main__":
     """
     from PIL import ImageDraw
 
-    block_size = 1536
+    block_size = 16
 
     # Toggle: False = standard nn.Linear (no quantization)
     USE_NVFP4 = True
@@ -1206,7 +1322,7 @@ if __name__ == "__main__":
     print(f"Loading from {model_id} (source: {download_source}) ...")
     model = NVFP4QuantizedSana.from_pretrained(
         model_id, download_source=download_source, cache_dir=cache_dir,
-        block_size=block_size, use_nvfp4=USE_NVFP4,
+        block_size=block_size, use_nvfp4=USE_NVFP4
     )
     model.to(device=device)
 
@@ -1217,7 +1333,6 @@ if __name__ == "__main__":
         print("  NVFP4 quantization active [OK]")
     else:
         print("  Unquantized mode -- using standard nn.Linear [OK]")
-
     # ====================================================================
     # Inference
     # ====================================================================
@@ -1266,7 +1381,7 @@ if __name__ == "__main__":
         ).images[0]
 
     # ---- Save ----
-    output_dir = "outputs/images"
+    output_dir = "G:/Outputs/Efficient-Diffusion/images"
     os.makedirs(output_dir, exist_ok=True)
 
     draw = ImageDraw.Draw(image)
@@ -1279,7 +1394,7 @@ if __name__ == "__main__":
     )
     draw.text((padding, padding), prompt, fill=(255, 255, 255))
 
-    save_path = os.path.join(output_dir, "sana_nvfp4_sample_bs1536.png")
+    save_path = os.path.join(output_dir, "sana_nvfp4_sample_bs16.png")
     image.save(save_path)
     print(f"  Image saved to: {save_path}")
     """
@@ -1287,7 +1402,7 @@ if __name__ == "__main__":
     # NVFP4 Correctness Verification: three-way forward output comparison
     #   (1) diffusers original vs (2) NVFP4QuantizedSana(unquantized) vs (3) NVFP4QuantizedSana(NVFP4)
     # ====================================================================
-    # """
+    """
     print("\n\n" + "=" * 70)
     print("NVFP4 Correctness Verification: Three-way forward comparison")
     print("=" * 70)
@@ -1316,7 +1431,7 @@ if __name__ == "__main__":
 
     print("\n[Loading NVFP4QuantizedSana (use_nvfp4=True, block_size=256) ...]")
     model_q = NVFP4QuantizedSana.from_pretrained(
-        model_id, block_size=block_size, use_nvfp4=True,
+        model_id, block_size=block_size, use_nvfp4=True, rotation="hadamard", permutation="mag",
         download_source=os.environ.get("DOWNLOAD_SOURCE", "modelscope").lower(),
         cache_dir=cache_dir,
     ).to(device).eval()
@@ -1388,4 +1503,4 @@ if __name__ == "__main__":
     del ref_model, model_uq, model_q
     if device == "cuda":
         torch.cuda.empty_cache()
-    # """
+    """

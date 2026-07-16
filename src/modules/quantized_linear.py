@@ -4,12 +4,13 @@ import torch.nn.functional as F
 
 # supports both package import and direct script execution
 try:
-    from ..quant_utils.quantization import AsymmetricQuantization
+    from ..quant_utils.quantization import (
+        AsymmetricQuantization, NVFP4Quantization, NVFP4ActivationQuantization)
 except ImportError:
     import sys, os
     _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, _src)
-    from quant_utils.quantization import AsymmetricQuantization
+    from quant_utils.quantization import AsymmetricQuantization, NVFP4Quantization
 
 
 class QuantizedLinear(nn.Linear):
@@ -52,6 +53,98 @@ class QuantizedLinear(nn.Linear):
             self.parameter_quantization_axis, quantization_error_info, pref + 'weight'
         )
         return F.linear(quantized_input, quantized_weight, self.bias)
+
+
+class NVFP4Linear(nn.Linear):
+    """Linear layer with NVFP4 (two-level scaled 4-bit) weight quantization.
+
+    Optionally applies a rotation and/or a permutation on the contraction
+    (feature) dim before quantization. The SAME transform is applied to the
+    activation, so the (un-quantized) output is mathematically identical to a
+    plain ``nn.Linear``.
+
+    Args:
+        rotation:     RotationBase instance or None.
+        permutation:  PermutationBase instance or None.
+        quantize:     if False, the transform is still applied but the weight is
+                      NOT quantized (useful for consistency testing).
+        block_size:   NVFP4 block size (default 16).
+    """
+
+    def __init__(self, in_features, out_features, bias=True, block_size=16,
+                 rotation=None, permutation=None, quantize=True, layer_prefix=None):
+        super().__init__(in_features, out_features, bias)
+        self.block_size = block_size
+        self.rotation = rotation
+        self.permutation = permutation
+        self.quantize = quantize
+        self.layer_prefix = layer_prefix
+        # The permutation is fitted on the ROTATED weight, so that a
+        # magnitude-based sort groups the columns of the final (to-be-quantized)
+        # representation. Order is therefore always: rotation first, then
+        # permutation (see _effective_weight / _effective_activation).
+        w_for_fit = self.rotation.rotate_weight(self.weight.data) if self.rotation is not None else self.weight.data
+        if self.permutation is not None:
+            self.permutation.fit(w_for_fit)
+
+    def _effective_weight(self):
+        # rotation first, then permutation
+        W = self.weight
+        if self.rotation is not None:
+            W = self.rotation.rotate_weight(W)
+        if self.permutation is not None:
+            W = self.permutation.transform_weight(W)
+        return W
+
+    def _effective_activation(self, x):
+        # rotation first, then permutation
+        if self.rotation is not None:
+            x = self.rotation.rotate_activation(x)
+        if self.permutation is not None:
+            x = self.permutation.transform_activation(x)
+        return x
+
+    def fit_permutation(self):
+        """(Re)fit the optional permutation on the CURRENT weight.
+
+        The permutation is always fitted on the ROTATED weight, matching the
+        ordering used in forward (rotation first, then permutation). Call this
+        AFTER the real weights have been loaded (e.g. via ``_copy_weights``).
+        """
+        if self.permutation is None:
+            return
+        w_for_fit = (self.rotation.rotate_weight(self.weight.data)
+                     if self.rotation is not None else self.weight.data)
+        self.permutation.fit(w_for_fit)
+
+    def forward(self, x, quantization_error_info=None):
+        W_eff = self._effective_weight()
+        x_eff = self._effective_activation(x)
+        if self.quantize:
+            # quantize WEIGHT in the rotated+permuted basis
+            Wq = NVFP4Quantization.apply(
+                W_eff, self.block_size,
+                quantization_error_info,
+                f"{self.layer_prefix}.weight" if self.layer_prefix else "weight",
+            )
+            # quantize ACTIVATION in the SAME transformed basis (R·P applied first,
+            # then FP4), so the block layout aligns with the weight's contraction
+            # dimension. NVFP4ActivationQuantization expects 3D [bs, n_seq, dim];
+            # for higher-rank activations we fuse all leading dims into (bs, n_seq)
+            # and restore the original shape afterwards (tokens are quantized
+            # independently along the last/feature dim, so ordering is irrelevant).
+            act_prefix = f"{self.layer_prefix}.input" if self.layer_prefix else "input"
+            orig_shape = x_eff.shape
+            xq3d = NVFP4ActivationQuantization.apply(
+                x_eff.reshape(orig_shape[0], -1, orig_shape[-1]),
+                self.block_size,
+                quantization_error_info, act_prefix,
+            )
+            xq = xq3d.reshape(orig_shape)
+        else:
+            Wq = W_eff
+            xq = x_eff
+        return F.linear(xq, Wq, self.bias)
 
 
 
