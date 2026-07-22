@@ -56,6 +56,7 @@ import torch.nn.functional as F
 
 from src.quant_utils.rotation import (RotationBase, IdentityRotation, HadamardRotation, RandomRotation, CayleyRotation, make_rotation)
 from src.quant_utils.permutation import (PermutationBase, IdentityPermutation, RandomPermutation, MagnitudeSortPermutation, make_permutation)
+from src.modules.quantized_linear import NVFP4Linear
     
 
 def _get_timestep_embedding(

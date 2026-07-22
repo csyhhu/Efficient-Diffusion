@@ -480,22 +480,24 @@ class ImageGeneration:
 
     
     def prepare_local_training(self):
+
         """Prepare data loaders and optimizer for local training."""
-        self.get_dataloader()
+        dataset_config = self._local_dataset_config
+        self.get_dataloader(dataset_name=dataset_config.get("dataset_name", "cifar100"))
         print(f"[train] Train loader: {len(self.train_loader)} batches, {len(self.train_loader.dataset)} samples")
         print(f"[train] Val loader: {len(self.val_loader)} batches, {len(self.val_loader.dataset)} samples")
         
-        running_cfg = self._local_running_config
+        running_config = self._local_running_config
         
         self.optimizer = torch.optim.Adam(
             self.transformer.parameters(),
-            lr=running_cfg.get("lr", 0.0001),
+            lr=running_config.get("lr", 0.0001),
             betas=(0.9, 0.999),
         )
         
         self.ema = EMAModel(self.transformer, decay=0.999)
         
-        mixed_precision = running_cfg.get("mixed_precision", None)
+        mixed_precision = running_config.get("mixed_precision", None)
         if mixed_precision and torch.cuda.is_available():
             print(f"[train] Enabling {mixed_precision} mixed precision training...")
             if mixed_precision == "bf16":
@@ -520,12 +522,12 @@ class ImageGeneration:
             output_dir = self._local_running_config.get("output_dir", "./outputs/cifar100_dit_fm")
         os.makedirs(output_dir, exist_ok=True)
         
-        running_cfg = self._local_running_config
-        epochs = running_cfg.get("epochs", 200)
-        sample_interval = running_cfg.get("sample_interval", 10)
-        test_prompt = running_cfg.get("test_prompt", "A cat")
-        num_steps = running_cfg.get("num_steps", 50)
-        record_interval = running_cfg.get("record_interval", 10)
+        running_config = self._local_running_config
+        epochs = running_config.get("epochs", 200)
+        sample_interval = running_config.get("sample_interval", 10)
+        test_prompt = running_config.get("test_prompt", "A cat")
+        num_steps = running_config.get("num_steps", 50)
+        record_interval = running_config.get("record_interval", 10)
         
         loss_history = []
         best_val_loss = float("inf")
@@ -1155,7 +1157,8 @@ class ImageGeneration:
         
         if test_mode:
             self.vae.eval()
-            images = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            with torch.no_grad():
+                images = self.vae.decode(latents.detach() / self.vae.config.scaling_factor, return_dict=False)[0]
             images = images.clamp(0, 1)
             from src.utils import save_sample_grid
             save_sample_grid(images, os.path.join(save_path, "test_images.png"), nrow=1)
@@ -1344,9 +1347,19 @@ class ImageGeneration:
                 print(f"Step-wise loss plot (step {step_idx}) saved to: {plot_path}")
             plt.close()
 
-    def compute_distillation_loss(self, ref_model, batch_data, criterion, num_steps, loss_fn=F.mse_loss, **kwargs):
+    def compute_distillation_loss(self, ref_model, batch_data, criterion, num_steps, loss_fn=F.mse_loss, single_step_mode=True, **kwargs):
         """
         Compute the distillation loss between the reference model and the current model under different criterion.
+        
+        Args:
+            ref_model: Reference model (unquantized)
+            batch_data: Dictionary containing input data
+            criterion: Loss criterion ('module-wise', 'layer-wise', 'step-wise')
+            num_steps: Number of diffusion steps
+            loss_fn: Loss function (default: MSE)
+            single_step_mode: If True, sample a random timestep and compute loss only at that step
+                              (like diffusion training). This significantly reduces memory usage.
+                              If False, perform full multi-step decoding (higher memory usage).
         """
         timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device)
         dt = 1.0 / num_steps
@@ -1358,11 +1371,14 @@ class ImageGeneration:
         
         hidden_states = batch_data.get('x')
         encoder_hidden_states = batch_data.get('encoder_hidden_states')
+
+        if single_step_mode:
+            return self._compute_single_step_loss(ref_model, batch_data, criterion, num_steps, loss_fn, **kwargs)
+
         latent_target = hidden_states
         latent_ref = hidden_states.clone().detach()
 
         for i in range(num_steps):
-
             step_wise_module_loss_dict = {}
             step_wise_layer_loss_dict = {}  
             
@@ -1370,7 +1386,6 @@ class ImageGeneration:
                 t_batch = timesteps[i].expand(latent_target.shape[0])
                 output_target = self.transformer(
                     latent_target, t_batch, encoder_hidden_states, 
-                    # quantization_error_info=kwargs.get('quantization_error_info')
                 )
                 with torch.no_grad():
                     output_ref = ref_model(latent_ref, t_batch, encoder_hidden_states)
@@ -1382,13 +1397,9 @@ class ImageGeneration:
                         loss_acm_act += loss_act
                         loss_acm_param += loss_param
 
-                        ref_module = ref_model.get_submodule(name) 
                         loss_layer_wise = loss_fn(output_ref.detach(), output_target)
                         step_wise_layer_loss_dict[name] = loss_layer_wise.item()
                         loss_acm_layer_wise += loss_layer_wise
-                    else:
-                        # print(f"{name:<40s}: {type(module)}")
-                        pass
                 
                 loss_step_wise = loss_fn(output_target, output_ref)
                 loss_acm_step_wise += loss_step_wise
@@ -1416,86 +1427,75 @@ class ImageGeneration:
                 self.scheduler.set_begin_index(0)
                 scm_timesteps = self.scheduler.timesteps[:-1].to(self.device).type(self.dtype)
 
-                latent_target_scaled = latent_target * sigma_data
-                latent_ref_scaled = latent_ref * sigma_data
+                t = scm_timesteps[i]
+                timestep = t.expand(latent_target.shape[0])
+                scm_t = torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))
+                scm_t = scm_t.to(self.dtype)
+                scm_t_expanded = scm_t.view(-1, 1, 1, 1)
+                
+                model_input_target = latent_target * torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded)**2)
+                model_input_ref = latent_ref * torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded)**2)
+                model_input_target = model_input_target.to(self.dtype)
+                model_input_ref = model_input_ref.to(self.dtype)
 
-                for step_idx, t in enumerate(scm_timesteps):
-                    timestep = t.expand(latent_target_scaled.shape[0])
-                    latents_model_input_target = latent_target_scaled / sigma_data
-                    latents_model_input_ref = latent_ref_scaled / sigma_data
-
-                    scm_t = torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))
-                    scm_t = scm_t.to(self.dtype)
-                    scm_t_expanded = scm_t.view(-1, 1, 1, 1)
-                    model_input_target = latents_model_input_target * torch.sqrt(
-                        scm_t_expanded**2 + (1 - scm_t_expanded) ** 2
-                    )
-                    model_input_ref = latents_model_input_ref * torch.sqrt(
-                        scm_t_expanded**2 + (1 - scm_t_expanded) ** 2
-                    )
-                    model_input_target = model_input_target.to(self.dtype)
-                    model_input_ref = model_input_ref.to(self.dtype)
-
-                    if hasattr(self.transformer, 'config'):
-                        output_target = self.transformer(
-                            hidden_states=model_input_target,
+                if hasattr(self.transformer, 'config'):
+                    output_target = self.transformer(
+                        hidden_states=model_input_target,
+                        encoder_hidden_states=encoder_hidden_states,
+                        timestep=scm_t, guidance=guidance, return_dict=False,
+                    )[0]
+                    with torch.no_grad():
+                        output_ref = ref_model(
+                            hidden_states=model_input_ref,
                             encoder_hidden_states=encoder_hidden_states,
                             timestep=scm_t, guidance=guidance, return_dict=False,
                         )[0]
-                        with torch.no_grad():
-                            output_ref = ref_model(
-                                hidden_states=model_input_ref,
-                                encoder_hidden_states=encoder_hidden_states,
-                                timestep=scm_t, guidance=guidance, return_dict=False,
-                            )[0]
-                    else:
-                        output_target = self.transformer(
-                            x=model_input_target, t=scm_t, encoder_hidden_states=encoder_hidden_states,
-                        )
-                        with torch.no_grad():
-                            output_ref = ref_model(
-                                x=model_input_ref, t=scm_t, encoder_hidden_states=encoder_hidden_states,
-                            )
-
-                    for name, module in self.transformer.named_modules():
-                        if isinstance(module, NVFP4Linear):
-                            loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
-                            step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
-                            loss_acm_act += loss_act
-                            loss_acm_param += loss_param
-
-                            ref_module = ref_model.get_submodule(name) 
-                            loss_layer_wise = loss_fn(output_ref.detach(), output_target)
-                            step_wise_layer_loss_dict[name] = loss_layer_wise.item()
-                            loss_acm_layer_wise += loss_layer_wise
-
-                    loss_step_wise = loss_fn(output_target, output_ref)
-                    loss_acm_step_wise += loss_step_wise
-
-                    error_info[i] = {
-                        "module_loss": step_wise_module_loss_dict,
-                        "layer_loss": step_wise_layer_loss_dict,
-                        "step_loss": loss_step_wise.item(),
-                    }
-
-                    noise_pred_target = (
-                        (1 - 2 * scm_t_expanded) * model_input_target
-                        + (1 - 2 * scm_t_expanded + 2 * scm_t_expanded**2) * output_target
-                    ) / torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded) ** 2)
-                    noise_pred_target = noise_pred_target.float() * sigma_data
-
-                    noise_pred_ref = (
-                        (1 - 2 * scm_t_expanded) * model_input_ref
-                        + (1 - 2 * scm_t_expanded + 2 * scm_t_expanded**2) * output_ref
-                    ) / torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded) ** 2)
-                    noise_pred_ref = noise_pred_ref.float() * sigma_data
-
-                    latent_target_scaled, _ = self.scheduler.step(noise_pred_target, timestep, latent_target_scaled, return_dict=False)
+                else:
+                    output_target = self.transformer(
+                        x=model_input_target, t=scm_t, encoder_hidden_states=encoder_hidden_states,
+                    )
                     with torch.no_grad():
-                        latent_ref_scaled, _ = self.scheduler.step(noise_pred_ref, timestep, latent_ref_scaled, return_dict=False)
+                        output_ref = ref_model(
+                            x=model_input_ref, t=scm_t, encoder_hidden_states=encoder_hidden_states,
+                        )
 
+                for name, module in self.transformer.named_modules():
+                    if isinstance(module, NVFP4Linear):
+                        loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
+                        step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
+                        loss_acm_act += loss_act
+                        loss_acm_param += loss_param
+
+                        loss_layer_wise = loss_fn(output_ref.detach(), output_target)
+                        step_wise_layer_loss_dict[name] = loss_layer_wise.item()
+                        loss_acm_layer_wise += loss_layer_wise
+
+                loss_step_wise = loss_fn(output_target, output_ref)
+                loss_acm_step_wise += loss_step_wise
+
+                error_info[i] = {
+                    "module_loss": step_wise_module_loss_dict,
+                    "layer_loss": step_wise_layer_loss_dict,
+                    "step_loss": loss_step_wise.item(),
+                }
+
+                noise_pred_target = (
+                    (1 - 2 * scm_t_expanded) * model_input_target
+                    + (1 - 2 * scm_t_expanded + 2 * scm_t_expanded**2) * output_target
+                ) / torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded) ** 2)
+                noise_pred_target = noise_pred_target.float() * sigma_data
+
+                noise_pred_ref = (
+                    (1 - 2 * scm_t_expanded) * model_input_ref
+                    + (1 - 2 * scm_t_expanded + 2 * scm_t_expanded**2) * output_ref
+                ) / torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded) ** 2)
+                noise_pred_ref = noise_pred_ref.float() * sigma_data
+
+                latent_target_scaled, _ = self.scheduler.step(noise_pred_target, timestep, latent_target * sigma_data, return_dict=False)
                 latent_target = (latent_target_scaled / sigma_data).to(self.dtype)
-                latent_ref = (latent_ref_scaled / sigma_data).detach()
+                with torch.no_grad():
+                    latent_ref_scaled, _ = self.scheduler.step(noise_pred_ref, timestep, latent_ref * sigma_data, return_dict=False)
+                    latent_ref = (latent_ref_scaled / sigma_data).detach()
 
             else:
                 raise ValueError(f"Scheduler type {type(self.scheduler)} is not supported.")
@@ -1504,6 +1504,149 @@ class ImageGeneration:
         error_info['final'] = final_loss.item()
 
         return_dict = [latent_target, error_info]
+        if criterion == "module-wise":
+            total_loss = loss_acm_act + loss_acm_param
+        elif criterion == "layer-wise":
+            total_loss = loss_acm_layer_wise
+        elif criterion == "step-wise":
+            total_loss = loss_acm_step_wise
+        else:
+            raise ValueError(f"Criterion type {criterion} is not supported.")
+        return_dict.append(total_loss)
+        return return_dict
+
+    def _compute_single_step_loss(self, ref_model, batch_data, criterion, num_steps, loss_fn=F.mse_loss, **kwargs):
+        """
+        Compute distillation loss at a single randomly sampled timestep (like diffusion training).
+        This significantly reduces memory usage by avoiding multi-step forward passes.
+        
+        Args:
+            ref_model: Reference model (unquantized)
+            batch_data: Dictionary containing input data
+            criterion: Loss criterion ('module-wise', 'layer-wise', 'step-wise')
+            num_steps: Number of diffusion steps
+            loss_fn: Loss function (default: MSE)
+        """
+        timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device)
+        sampled_step_idx = torch.randint(0, num_steps, (1,)).item()
+        
+        hidden_states = batch_data.get('x')
+        encoder_hidden_states = batch_data.get('encoder_hidden_states')
+        
+        error_info = {}
+        loss_acm_act = torch.tensor(0.0, device=self.device)
+        loss_acm_param = torch.tensor(0.0, device=self.device)
+        loss_acm_layer_wise = torch.tensor(0.0, device=self.device)
+        loss_acm_step_wise = torch.tensor(0.0, device=self.device)
+
+        if isinstance(self.scheduler, FlowMatchingScheduler):
+            t_batch = timesteps[sampled_step_idx].expand(hidden_states.shape[0])
+            
+            output_target = self.transformer(hidden_states, t_batch, encoder_hidden_states)
+            
+            with torch.no_grad():
+                output_ref = ref_model(hidden_states, t_batch, encoder_hidden_states)
+
+            step_wise_module_loss_dict = {}
+            step_wise_layer_loss_dict = {}
+            
+            for name, module in self.transformer.named_modules():
+                if isinstance(module, NVFP4Linear):
+                    loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
+                    step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
+                    loss_acm_act += loss_act
+                    loss_acm_param += loss_param
+
+                    loss_layer_wise = loss_fn(output_ref.detach(), output_target)
+                    step_wise_layer_loss_dict[name] = loss_layer_wise.item()
+                    loss_acm_layer_wise += loss_layer_wise
+
+            loss_step_wise = loss_fn(output_target, output_ref)
+            loss_acm_step_wise += loss_step_wise
+
+            error_info[sampled_step_idx] = {
+                "module_loss": step_wise_module_loss_dict,
+                "layer_loss": step_wise_layer_loss_dict,
+                "step_loss": loss_step_wise.item(),
+            }
+            error_info['final'] = loss_step_wise.item()
+            
+            return_dict = [hidden_states, error_info]
+
+        elif isinstance(self.scheduler, SCMScheduler):
+            sigma_data = float(self.scheduler.config.sigma_data) if hasattr(self.scheduler, 'config') else self._sigma_data
+            guidance_embeds_scale = getattr(getattr(self.transformer, 'config', None), "guidance_embeds_scale", 0.1)
+
+            guidance = torch.full([hidden_states.shape[0]], kwargs.get("guidance", 4.5), device=self.device, dtype=torch.float32)
+            guidance = guidance.to(self.dtype) * guidance_embeds_scale
+
+            self.scheduler.set_timesteps(
+                num_steps, device=self.device,
+                max_timesteps=1.5708,
+                intermediate_timesteps=(1.3 if num_steps == 2 else None),
+            )
+            self.scheduler.set_begin_index(0)
+            scm_timesteps = self.scheduler.timesteps[:-1].to(self.device).type(self.dtype)
+
+            t = scm_timesteps[sampled_step_idx]
+            timestep = t.expand(hidden_states.shape[0])
+            scm_t = torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))
+            scm_t = scm_t.to(self.dtype)
+            scm_t_expanded = scm_t.view(-1, 1, 1, 1)
+            
+            model_input = hidden_states * torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded)**2)
+            model_input = model_input.to(self.dtype)
+
+            if hasattr(self.transformer, 'config'):
+                output_target = self.transformer(
+                    hidden_states=model_input,
+                    encoder_hidden_states=encoder_hidden_states,
+                    timestep=scm_t, guidance=guidance, return_dict=False,
+                )[0]
+                with torch.no_grad():
+                    output_ref = ref_model(
+                        hidden_states=model_input,
+                        encoder_hidden_states=encoder_hidden_states,
+                        timestep=scm_t, guidance=guidance, return_dict=False,
+                    )[0]
+            else:
+                output_target = self.transformer(
+                    x=model_input, t=scm_t, encoder_hidden_states=encoder_hidden_states,
+                )
+                with torch.no_grad():
+                    output_ref = ref_model(
+                        x=model_input, t=scm_t, encoder_hidden_states=encoder_hidden_states,
+                    )
+
+            step_wise_module_loss_dict = {}
+            step_wise_layer_loss_dict = {}
+            
+            for name, module in self.transformer.named_modules():
+                if isinstance(module, NVFP4Linear):
+                    loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
+                    step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
+                    loss_acm_act += loss_act
+                    loss_acm_param += loss_param
+
+                    loss_layer_wise = loss_fn(output_ref.detach(), output_target)
+                    step_wise_layer_loss_dict[name] = loss_layer_wise.item()
+                    loss_acm_layer_wise += loss_layer_wise
+
+            loss_step_wise = loss_fn(output_target, output_ref)
+            loss_acm_step_wise += loss_step_wise
+
+            error_info[sampled_step_idx] = {
+                "module_loss": step_wise_module_loss_dict,
+                "layer_loss": step_wise_layer_loss_dict,
+                "step_loss": loss_step_wise.item(),
+            }
+            error_info['final'] = loss_step_wise.item()
+            
+            return_dict = [hidden_states, error_info]
+
+        else:
+            raise ValueError(f"Scheduler type {type(self.scheduler)} is not supported.")
+
         if criterion == "module-wise":
             total_loss = loss_acm_act + loss_acm_param
         elif criterion == "layer-wise":
