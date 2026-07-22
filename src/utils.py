@@ -21,6 +21,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from PIL import Image
+
 
 def load_config(config_path: str) -> dict:
     """Load YAML config file and return a plain dict.
@@ -61,8 +63,11 @@ def save_sample_grid(
         save_path:  output PNG file path.
         nrow:       number of images per row in the grid.
     """
-    # Denormalise [-1, 1] → [0, 1]
-    images = (samples + 1) / 2
+    # Denormalize [-1, 1] → [0, 1]
+    if torch.min(samples) < 0:
+        images = (samples + 1) / 2
+    else:
+        images = samples
     images = images.clamp(0, 1)
 
     B, C, H, W = images.shape
@@ -80,7 +85,7 @@ def save_sample_grid(
     grid = torch.cat(rows, dim=-2)              # (C, n_rows * H, nrow * W)
 
     # PIL expects (H, W) for grayscale, (H, W, C) for RGB
-    grid_np = grid.cpu().numpy()
+    grid_np = grid.float().cpu().numpy()
     if C == 1:
         grid_np = grid_np.squeeze(0)            # (H, W)
         cmap = "gray"
@@ -90,6 +95,56 @@ def save_sample_grid(
 
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     plt.imsave(save_path, grid_np, cmap=cmap)
+
+
+def save_pil_grid(
+    images: list,
+    save_path: str,
+    nrow: int = 4,
+    padding: int = 2,
+    background_color: tuple = (255, 255, 255)
+):
+    """Arrange a list of PIL Images into a grid and save as PNG.
+
+    Args:
+        images: list of PIL Image objects
+        save_path: output PNG file path
+        nrow: number of images per row in the grid
+        padding: padding between images in pixels
+        background_color: RGB tuple for background color
+    """
+    if not images:
+        raise ValueError("No images to save")
+
+    img_width, img_height = images[0].size
+
+    #
+    n_total = len(images)
+    nrow = min(nrow, n_total)
+    ncol = math.ceil(n_total / nrow)
+
+    #
+    grid_width = nrow * img_width + (nrow - 1) * padding
+    grid_height = ncol * img_height + (ncol - 1) * padding
+
+    #
+    grid_image = Image.new('RGB', (grid_width, grid_height), background_color)
+
+    #
+    for idx, img in enumerate(images):
+        row = idx // nrow
+        col = idx % nrow
+
+        # 计算位置
+        x = col * (img_width + padding)
+        y = row * (img_height + padding)
+
+        # 粘贴图像
+        grid_image.paste(img, (x, y))
+
+    #
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    grid_image.save(save_path, quality=95)
 
 
 # ============================================================================
@@ -166,3 +221,30 @@ class EMAModel:
     def load_state_dict(self, state_dict: dict):
         self.decay = state_dict["decay"]
         self._shadow = state_dict["shadow"]
+
+
+def _find_or_download_component(repo_id, cache_dir, required_files):
+    """Find existing component or download it from ModelScope."""
+    paths_to_check = [
+        os.path.join(cache_dir, repo_id),
+        os.path.join(cache_dir, repo_id.replace("/", "_")),
+        os.path.join(cache_dir, "._____temp", repo_id),
+    ]
+    
+    for path in paths_to_check:
+        if os.path.exists(path):
+            existing_files = [f for f in required_files if os.path.exists(os.path.join(path, f))]
+            if len(existing_files) >= len(required_files) // 2:
+                print(f"Found component at: {path}")
+                return path
+    
+    print(f"Downloading {repo_id} from ModelScope...")
+    from modelscope import snapshot_download
+    
+    local_path = snapshot_download(
+        repo_id,
+        cache_dir=cache_dir,
+        allow_patterns=required_files,
+    )
+    print(f"Downloaded to: {local_path}")
+    return local_path

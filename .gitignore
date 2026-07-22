@@ -33,3 +33,5 @@ outputs/**/*.png
 *.log
 
 ./Results/
+./data/
+./models/

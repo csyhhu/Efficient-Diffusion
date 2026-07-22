@@ -1,0 +1,12 @@
+# CIFAR100 dataset config
+
+dataset_name: "CIFAR100"
+batch_size: 256          # training batch size (increased for better GPU utilization)
+data_dir: "G://datasets//cifar-100-python"       # CIFAR100 download / storage directory
+image_size: 32          # CIFAR100 native resolution, no resize needed
+num_workers: 0          # DataLoader workers (0 required for GPU-based VAE encoding)
+pin_memory: false       # pin_memory disabled (data already on GPU from VAE encoding)
+persistent_workers: false  # Keep workers alive between epochs
+
+# Text encoder settings
+max_token_length: 77

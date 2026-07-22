@@ -282,8 +282,7 @@ class LatentDataset(Dataset):
 def _build_paths_and_captions(
     dataset_name: str,
     max_total: int,
-    cc12m_path: Optional[str] = None,
-    coco_path: Optional[str] = None,
+    dataset_path: Optional[str] = None
 ) -> Tuple[List[str], List[str], str]:
     """Download / locate images + captions, return ``(file_paths, captions, tmpdir)``.
 
@@ -293,20 +292,20 @@ def _build_paths_and_captions(
 
     if dataset_name == "coco":
         # --- Try local COCO 2017 dataset first (via pycocotools) ---
-        if coco_path and os.path.isdir(coco_path):
+        if dataset_path and os.path.isdir(dataset_path):
             from pycocotools.coco import COCO
-            ann_file = os.path.join(coco_path, "annotations", "captions_train2017.json")
-            img_dir = os.path.join(coco_path, "train2017")
+            ann_file = os.path.join(dataset_path, "annotations", "captions_train2017.json")
+            img_dir = os.path.join(dataset_path, "train2017")
             if not os.path.isfile(ann_file):
                 raise FileNotFoundError(
                     f"COCO caption annotations not found: {ann_file}\n"
                     f"Expected structure:\n"
-                    f"  {coco_path}/\n"
+                    f"  {dataset_path}/\n"
                     f"    annotations/captions_train2017.json\n"
                     f"    train2017/  (images)"
                 )
 
-            print(f"[data] Loading COCO 2017 from local: {coco_path}")
+            print(f"[data] Loading {dataset_name} from local: {dataset_path}")
             coco = COCO(ann_file)
             img_ids = sorted(coco.imgs.keys())
             rng = np.random.default_rng(42)
@@ -329,10 +328,10 @@ def _build_paths_and_captions(
 
         else:
             # --- Fallback: HuggingFace datasets (parquet-based) ---
-            print("[data] coco_path not provided or not found, trying HuggingFace ...")
+            print(f"[data] {dataset_path} not provided or not found, trying HuggingFace ...")
             from datasets import load_dataset
-            print("[data] Loading COCO 2017 captions (HuggingFace, lmms-lab/COCO-Caption2017) ...")
-            ds = load_dataset("lmms-lab/COCO-Caption2017", split="val")
+            print(f"[data] Loading {dataset_name} captions (HuggingFace, lmms-lab/{dataset_name}-Caption) ...")
+            ds = load_dataset(f"lmms-lab/{dataset_name}-Caption", split="val")
             ds = ds.shuffle(seed=42).select(range(min(max_total, len(ds))))
 
             image_paths = []
@@ -350,8 +349,8 @@ def _build_paths_and_captions(
 
     elif dataset_name == "flickr30k":
         from datasets import load_dataset
-        print("[data] Loading Flickr30k ...")
-        ds = load_dataset("nlphuji/flickr30k", split="test", trust_remote_code=True)
+        print(f"[data] Loading {dataset_name} ...")
+        ds = load_dataset(f"nlphuji/{dataset_name}", split="test", trust_remote_code=True)
         ds = ds.shuffle(seed=42).select(range(min(max_total, len(ds))))
 
         image_paths = []
@@ -369,8 +368,8 @@ def _build_paths_and_captions(
 
     elif dataset_name == "pokemon":
         from datasets import load_dataset
-        print("[data] Loading Pokemon BLIP captions (parquet) ...")
-        ds = load_dataset("svjack/pokemon-blip-captions-en-zh", split="train")
+        print(f"[data] Loading {dataset_name} BLIP captions (parquet) ...")
+        ds = load_dataset(f"svjack/{dataset_name}-blip-captions-en-zh", split="train")
         ds = ds.shuffle(seed=42).select(range(min(max_total, len(ds))))
 
         image_paths = []
@@ -385,11 +384,11 @@ def _build_paths_and_captions(
             captions.append(cap)
 
     elif dataset_name == "cc12m":
-        if cc12m_path is None:
-            raise ValueError("--cc12m_path is required for CC12M dataset.")
+        if dataset_path is None:
+            raise ValueError("--dataset_path is required for CC12M dataset.")
         import webdataset as wds
-        print(f"[data] Loading CC12M shards from {cc12m_path} ...")
-        ds = wds.WebDataset(cc12m_path).shuffle(1000).decode("pil")
+        print(f"[data] Loading CC12M shards from {dataset_path} ...")
+        ds = wds.WebDataset(dataset_path).shuffle(1000).decode("pil")
         image_paths = []
         captions = []
         for i, sample in enumerate(ds):
@@ -403,6 +402,46 @@ def _build_paths_and_captions(
             pil_img.save(fpath)
             image_paths.append(fpath)
             captions.append(cap)
+
+    elif dataset_name == "mjhq30k":
+        if dataset_path is None:
+            raise ValueError("--dataset_path is required for MJHQ-30K dataset.")
+        import json
+        meta_path = os.path.join(dataset_path, "meta_data.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(
+                f"MJHQ-30K metadata not found: {meta_path}\n"
+                f"Expected structure:\n"
+                f"  {dataset_path}/\n"
+                f"    meta_data.json\n"
+                f"    animals/, art/, fashion/, ... (image folders)"
+            )
+
+        print(f"[data] Loading MJHQ-30K from local: {dataset_path}")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta_data = json.load(f)
+
+        image_paths = []
+        captions = []
+        categories = ["animals", "art", "fashion", "food", "indoor", "landscape", "logo", "people", "plants", "vehicles"]
+        for img_hash, info in meta_data.items():
+            category = info.get("category", "")
+            if category not in categories:
+                continue
+            cap = info.get("prompt", "")
+            img_path = os.path.join(dataset_path, category, f"{img_hash}.jpg")
+            if not os.path.isfile(img_path):
+                continue
+            image_paths.append(img_path)
+            captions.append(cap)
+
+        rng = np.random.default_rng(42)
+        indices = np.arange(len(image_paths))
+        rng.shuffle(indices)
+        image_paths = [image_paths[i] for i in indices[:max_total]]
+        captions = [captions[i] for i in indices[:max_total]]
+
+        print(f"[data] Loaded {len(image_paths)} MJHQ-30K samples.")
 
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -418,8 +457,7 @@ def load_t2i_data_raw(
     dataset_name: str,
     max_samples: int = 20000,
     image_size: int = 256,
-    cc12m_path: Optional[str] = None,
-    coco_path: Optional[str] = None,
+    dataset_path: Optional[str] = None,
     val_samples: int = 1000,
     batch_size: int = 8,
     num_workers: int = 0,
@@ -432,11 +470,11 @@ def load_t2i_data_raw(
     **No VAE or T5 is needed** — use this for data inspection / visualisation.
 
     Args:
-        dataset_name:  ``"pokemon"`` | ``"coco"`` | ``"flickr30k"`` | ``"cc12m"``.
+        dataset_name:  ``"pokemon"`` | ``"coco"`` | ``"flickr30k"`` | ``"cc12m"`` | ``"mjhq30k"``.
         max_samples:   cap on training samples.
         image_size:    resize target (square).
-        cc12m_path:    glob pattern for webdataset shards (required for cc12m).
-        coco_path:     local COCO 2017 root directory (e.g. ``G:/datasets/coco2017``).
+        dataset_path:  glob pattern for webdataset shards (required for cc12m) or
+                       local dataset root directory (e.g. ``G:/datasets/coco2017`` or ``G:/datasets/MJHQ-30K``).
         val_samples:   number of samples reserved for validation.
         batch_size:    batch size for DataLoaders.
         num_workers:   DataLoader worker processes.
@@ -450,7 +488,7 @@ def load_t2i_data_raw(
     """
     max_total = max_samples + val_samples
     image_paths, captions, tmpdir = _build_paths_and_captions(
-        dataset_name, max_total, cc12m_path, coco_path,
+        dataset_name, max_total, dataset_path,
     )
 
     n_train = min(max_samples, len(image_paths) - val_samples)
@@ -618,6 +656,7 @@ def load_t2i_data(
     batch_size: int = 8,
     max_samples: int = 20000,
     image_size: int = 256,
+    dataset_path: Optional[str] = None,
     cc12m_path: Optional[str] = None,
     coco_path: Optional[str] = None,
     val_samples: int = 1000,
@@ -641,6 +680,7 @@ def load_t2i_data(
         image_size=image_size,
         cc12m_path=cc12m_path,
         coco_path=coco_path,
+        mjhq30k_path=mjhq30k_path,
         val_samples=val_samples,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -835,6 +875,7 @@ def load_t2i_data_tokenized(
     batch_size: int = 8,
     max_samples: int = 20000,
     image_size: int = 256,
+    dataset_path: Optional[str] = None,
     cc12m_path: Optional[str] = None,
     coco_path: Optional[str] = None,
     val_samples: int = 1000,
@@ -857,7 +898,7 @@ def load_t2i_data_tokenized(
     """
     max_total = max_samples + val_samples
     image_paths, captions, tmpdir = _build_paths_and_captions(
-        dataset_name, max_total, cc12m_path, coco_path,
+        dataset_name, max_total, cc12m_path, coco_path, mjhq30k_path,
     )
 
     n_train = min(max_samples, len(image_paths) - val_samples)
@@ -914,24 +955,15 @@ def load_t2i_data_tokenized(
 
 if __name__ == "__main__":
     
-    # ============================================================
-    # Configuration: local cache path & HF mirror
-    # ============================================================
-    HF_CACHE = r"G:\datasets"
-    COCO_LOCAL = r"G:\datasets\coco2017"
-
+    
+    HF_CACHE = r"G://datasets"
+    output_dir = "G://datasets"
+    
     os.makedirs(HF_CACHE, exist_ok=True)
     os.environ["HF_DATASETS_CACHE"] = HF_CACHE
     # Use HF mirror for faster access (set to None if not needed)
     if "HF_ENDPOINT" not in os.environ:
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
-    print(f"[setup] HF_DATASETS_CACHE = {HF_CACHE}")
-    print(f"[setup] COCO_LOCAL        = {COCO_LOCAL}  (exists: {os.path.isdir(COCO_LOCAL)})")
-    if not os.path.isdir(COCO_LOCAL):
-        print(f"[setup]   -> Local COCO not found, will download from HuggingFace (lmms-lab/COCO-Caption2017)")
-
-    os.makedirs("./outputs", exist_ok=True)
 
     # ---- Test 1: Raw DataLoader ----
     # """
@@ -940,8 +972,10 @@ if __name__ == "__main__":
     print("=" * 50)
 
     train_raw, val_raw, tmpdir = load_t2i_data_raw(
-        "coco", max_samples=50, val_samples=10, batch_size=9,
-        coco_path=COCO_LOCAL,
+        # "coco", coco_path="G://datasets//coco2017",
+        "mjhq30k", mjhq30k_path="G://datasets//MJHQ-30K",
+        max_samples=50, val_samples=10, batch_size=9
+        
     )
     print(f"[data] train batches: {len(train_raw)}, val batches: {len(val_raw)}")
 
@@ -951,10 +985,10 @@ if __name__ == "__main__":
 
     visualize_raw_batch(
         train_raw, num_samples=9,
-        save_path="./outputs/coco_raw_batch.png",
+        save_path=f"{output_dir}/mjhq30k_raw_batch.png",
     )
 
-    shutil.rmtree(tmpdir, ignore_errors=True)
+    # shutil.rmtree(tmpdir, ignore_errors=True)
     # """
 
     # ---- Test 2: Two-stage workflow ----

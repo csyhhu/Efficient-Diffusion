@@ -7,16 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# supports both package import and direct script execution
-try:
-    from ..modules.quantized_linear import QuantizedLinear
-    from ..modules.quantized_mha import QuantizedMultiHeadAttention
-except ImportError:
-    import sys, os
-    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, _src)
-    from modules.quantized_linear import QuantizedLinear
-    from modules.quantized_mha import QuantizedMultiHeadAttention
+import sys, os
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _src)
+from modules.quantized_linear import QuantizedLinear
+from modules.quantized_mha import QuantizedMultiHeadAttention
 
 
 # ---------------------------------------------------------------------------

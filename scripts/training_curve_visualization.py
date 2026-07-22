@@ -1,6 +1,7 @@
 
 
 import csv
+import json
 import os
 import re
 import sys
@@ -20,25 +21,54 @@ if _project_root not in sys.path:
 # ============================================================================
 
 def read_loss_history(path: str) -> list:
-    """Read a ``loss_history.csv`` file and return the ``train_loss`` column as a list of floats.
+    """Read a loss_history file (CSV or JSON) and return the loss values as a list of floats.
 
     Expected CSV columns: ``step,epoch,train_loss``
+    Expected JSON format: List of dicts with ``loss`` and ``avg_loss`` keys.
 
     Args:
-        path: Absolute or relative path to the CSV file.
+        path: Absolute or relative path to the CSV or JSON file.
 
     Returns:
-        List of train_loss values in chronological order.
+        List of loss values in chronological order.
     """
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"loss_history.csv not found: {path}")
+        raise FileNotFoundError(f"loss_history file not found: {path}")
 
-    loss = []
-    with open(path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            loss.append(float(row["train_loss"]))
-    return loss
+    if path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [float(item["loss"]) for item in data]
+    else:
+        loss = []
+        with open(path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                loss.append(float(row["train_loss"]))
+        return loss
+
+
+def read_loss_history_with_meta(path: str) -> dict:
+    """Read loss_history JSON file with full metadata.
+
+    Args:
+        path: Absolute or relative path to the JSON file.
+
+    Returns:
+        Dict with keys: 'loss', 'avg_loss', 'steps', 'epochs'.
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"loss_history file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return {
+        "loss": [float(item["loss"]) for item in data],
+        "avg_loss": [float(item["avg_loss"]) for item in data],
+        "steps": [int(item["step"]) for item in data],
+        "epochs": [int(item["epoch"]) for item in data],
+    }
 
 
 def read_quant_error_dir(dir_path: str) -> Dict[str, List[float]]:
@@ -338,7 +368,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Configure your runs here.
     # Each entry specifies:
-    #   path   – relative (from project root) or absolute path to loss_history.csv
+    #   path   – relative (from project root) or absolute path to loss_history.csv/json
     #   label  – legend name displayed on the plot
     #   color  – matplotlib colour string
     #   style  – matplotlib linestyle  ("-", "--", "-.", ":")
@@ -346,6 +376,13 @@ if __name__ == "__main__":
     #   quant_error_dir – optional path to quant_error/ folder for per-layer plots
     # ------------------------------------------------------------------
     loss_info_dict: dict = {
+        "cifar100-dit-fm": {
+            "path":  r"G:\Outputs\Efficient-Diffusion\cifar100_dit_fm_sz64\loss_history.json",
+            "label": "CIFAR100 DiT (Flow Matching)",
+            "color": "#1f77b4",   # blue
+            "style": "-",
+            "smooth": 0.0,
+        },
         # "ddpm-dit": {
         #     "path":  os.path.join(_project_root, "outputs", "mnist_ddpm_dit", "loss_history.csv"),
         #     "label": "DDPM (DiT)",
@@ -353,22 +390,14 @@ if __name__ == "__main__":
         #     "style": "-",
         #     "smooth": 0.0,
         # },
-        # "ddpm-quantized-dit-trial-0": {
-        #     "path":  os.path.join(_project_root, "Results", "mnist_ddpm_quantized_dit_trial_0", "loss_history.csv"),
-        #     "label": "DDPM (Quantized DiT) - Trial 0",
+        # "ddpm-quantized-dit-trial-1": {
+        #     "path":  os.path.join(_project_root, "Results", "mnist_ddpm_quantized_dit", "loss_history.csv"),
+        #     "label": "DDPM (Quantized DiT)",
         #     "color": "#9467bd",   # purple
         #     "style": "-",
         #     "smooth": 0.0,
         #     "quant_error_dir": os.path.join(_project_root, "Results", "mnist_ddpm_quantized_dit", "quant_error"),
         # },
-        "ddpm-quantized-dit-trial-1": {
-            "path":  os.path.join(_project_root, "Results", "mnist_ddpm_quantized_dit", "loss_history.csv"),
-            "label": "DDPM (Quantized DiT)",
-            "color": "#1f77b4",   # blue
-            "style": "-",
-            "smooth": 0.0,
-            "quant_error_dir": os.path.join(_project_root, "Results", "mnist_ddpm_quantized_dit", "quant_error"),
-        },
         # "fm-dit": {
         #     "path":  os.path.join(_project_root, "outputs", "mnist_fm_dit", "loss_history.csv"),
         #     "label": "Flow Matching (DiT)",
@@ -387,7 +416,6 @@ if __name__ == "__main__":
     }
 
     # ---- Figure 1: Loss curves ----
-    """
     for name, info in loss_info_dict.items():
         loss = read_loss_history(info["path"])
         # Apply optional smoothing
@@ -397,24 +425,27 @@ if __name__ == "__main__":
             for v in loss[1:]:
                 smoothed.append(smooth * smoothed[-1] + (1 - smooth) * v)
             loss = smoothed
-        plt.plot(loss,
-                 label=info["label"],
-                 color=info["color"],
-                 linestyle=info.get("style", "-"),
-                 linewidth=1.2)
+        plt.plot(
+            loss,
+            label=info["label"],
+            color=info["color"],
+            linestyle=info.get("style", "-"),
+            linewidth=1.2
+        )
 
     plt.legend()
     plt.xlabel("Iterations")
     plt.ylabel("Loss")
-    plt.title("MNIST Training Curve")
+    plt.title("Training Curve")
     plt.grid(alpha=0.3, linestyle="--")
     plt.tight_layout()
-    # plt.savefig("mnist_training_curve.png", dpi=150)
+    # plt.savefig(os.path.join(_project_root, "outputs", "cifar100_dit_fm_training_curve.png"), dpi=150)
+    # print(f"Saved training curve to outputs/cifar100_dit_fm_training_curve.png")
     plt.show()
-    plt.close()
-    """
+    # plt.close()
 
     # ---- Figure 2: Quantization error per layer (all components) ----
+    """
     for name, info in loss_info_dict.items():
         quant_dir = info.get("quant_error_dir", None)
         if quant_dir is None or not os.path.isdir(quant_dir):
@@ -422,7 +453,7 @@ if __name__ == "__main__":
         print(f"[quant-error-viz] Reading {quant_dir} ...")
         quant_data = read_quant_error_dir(quant_dir)
         out_base = os.path.dirname(quant_dir)
-        """
+
         if not quant_data:
             print(f"[quant-error-viz] No CSV files found in {quant_dir}")
             continue
@@ -435,7 +466,6 @@ if __name__ == "__main__":
         )
         plt.show()
         plt.close()
-        """
 
         # ---- Figure 3: Anomalous layers (error increasing instead of decreasing) ----
         anomalous = find_anomalous_layers(quant_data)
@@ -447,3 +477,4 @@ if __name__ == "__main__":
         )
         plt.show()
         plt.close()
+    """

@@ -152,8 +152,8 @@ def _nearest_quantize(x, ref_values):
     """
     orig_shape = x.shape
     x_flat = x.reshape(-1)
-    # Ensure x is on the same device as ref_values
-    ref_values = ref_values.to(x.device)
+    # Ensure ref_values is on the same device and dtype as x
+    ref_values = ref_values.to(x.device).to(x.dtype)
     # Clamp x to valid range before searchsorted
     x_flat = x_flat.clamp(min=ref_values[0], max=ref_values[-1])
     # Binary search to find insertion positions
@@ -464,7 +464,7 @@ class NVFP4ActivationQuantization(torch.autograd.Function):
 
         # Merge batch and sequence dimensions: [num_tokens, dim]
         num_tokens = bs * n_seq
-        x_2d = x_.reshape(num_tokens, dim).float()
+        x_2d = x_.reshape(num_tokens, dim)
 
         # Pad last dim and reshape to blocks: [num_tokens, num_blocks, block_size]
         pad_dim = (block_size_ - dim % block_size_) % block_size_

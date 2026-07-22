@@ -1,0 +1,24 @@
+# Running / Training config for CIFAR100 + DiT + Flow Matching
+# Referenced by main.py training loop
+
+# ── Scheduler ──
+sample_type: "fm"         # "ddpm" | "fm" | "cm"
+scheduler: "fm"           # triggers FlowMatchingScheduler
+
+# ── FM-specific ──
+num_steps: 50            # number of sampling steps
+
+# ── Training ──
+lr: 0.0001               # learning rate (Adam)
+epochs: 100                # number of training epochs (reduced for testing)
+output_dir: "G:///Outputs/cifar100_dit_fm"  # output directory for checkpoints and samples
+test_prompt: "A cat"  # test prompt for sample generation
+
+# ── Performance optimizations ──
+torch_compile: false      # Enable torch.compile for speedup (requires triton)
+compile_mode: "default"   # torch.compile mode: default, reduce-overhead, max-autotune
+gradient_checkpointing: false  # Enable gradient checkpointing (trades memory for compute)
+mixed_precision: "bf16"   # Mixed precision: "bf16", "fp16", or null
+
+# ── Sampling ──
+sample_interval: 10      # generate sample images every N epochs

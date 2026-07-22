@@ -3,14 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # supports both package import and direct script execution
-try:
-    from ..quant_utils.quantization import (
-        AsymmetricQuantization, NVFP4Quantization, NVFP4ActivationQuantization)
-except ImportError:
-    import sys, os
-    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, _src)
-    from quant_utils.quantization import AsymmetricQuantization, NVFP4Quantization
+# import sys, os
+# sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# from quant_utils.quantization import AsymmetricQuantization, NVFP4Quantization, NVFP4ActivationQuantization
+# from quant_utils.rotation import make_rotation
+# from quant_utils.permutation import make_permutation
+
+from src.quant_utils.quantization import AsymmetricQuantization, NVFP4Quantization, NVFP4ActivationQuantization
+from src.quant_utils.rotation import make_rotation
+from src.quant_utils.permutation import make_permutation
 
 
 class QuantizedLinear(nn.Linear):
@@ -71,21 +72,25 @@ class NVFP4Linear(nn.Linear):
         block_size:   NVFP4 block size (default 16).
     """
 
-    def __init__(self, in_features, out_features, bias=True, block_size=16,
-                 rotation=None, permutation=None, quantize=True, layer_prefix=None):
+    def __init__(
+        self, in_features, out_features, bias=True, 
+        rotation=None, permutation=None, permute_weight=True, 
+        quantize=True, block_size=16, layer_prefix=None
+    ):
         super().__init__(in_features, out_features, bias)
         self.block_size = block_size
-        self.rotation = rotation
-        self.permutation = permutation
+        self.rotation = make_rotation(rotation, in_features)
+        self.permutation = make_permutation(permutation)
         self.quantize = quantize
         self.layer_prefix = layer_prefix
-        # The permutation is fitted on the ROTATED weight, so that a
-        # magnitude-based sort groups the columns of the final (to-be-quantized)
-        # representation. Order is therefore always: rotation first, then
-        # permutation (see _effective_weight / _effective_activation).
-        w_for_fit = self.rotation.rotate_weight(self.weight.data) if self.rotation is not None else self.weight.data
-        if self.permutation is not None:
-            self.permutation.fit(w_for_fit)
+        self.permute_weight = permute_weight
+        if self.permute_weight and self.permutation is not None:
+            self.permutation.fit(self.weight)
+        self.x_eff = None
+        self.W_eff = None
+        self.x_quant = None
+        self.W_quant = None
+        self.output = None
 
     def _effective_weight(self):
         # rotation first, then permutation
@@ -97,33 +102,21 @@ class NVFP4Linear(nn.Linear):
         return W
 
     def _effective_activation(self, x):
-        # rotation first, then permutation
         if self.rotation is not None:
             x = self.rotation.rotate_activation(x)
+        if not self.permute_weight and self.permutation is not None:
+            self.permutation.fit(x)
         if self.permutation is not None:
             x = self.permutation.transform_activation(x)
         return x
 
-    def fit_permutation(self):
-        """(Re)fit the optional permutation on the CURRENT weight.
-
-        The permutation is always fitted on the ROTATED weight, matching the
-        ordering used in forward (rotation first, then permutation). Call this
-        AFTER the real weights have been loaded (e.g. via ``_copy_weights``).
-        """
-        if self.permutation is None:
-            return
-        w_for_fit = (self.rotation.rotate_weight(self.weight.data)
-                     if self.rotation is not None else self.weight.data)
-        self.permutation.fit(w_for_fit)
-
     def forward(self, x, quantization_error_info=None):
-        W_eff = self._effective_weight()
-        x_eff = self._effective_activation(x)
+        self.x_eff = self._effective_activation(x)
+        self.W_eff = self._effective_weight()
         if self.quantize:
             # quantize WEIGHT in the rotated+permuted basis
-            Wq = NVFP4Quantization.apply(
-                W_eff, self.block_size,
+            self.W_quant = NVFP4Quantization.apply(
+                self.W_eff, self.block_size,
                 quantization_error_info,
                 f"{self.layer_prefix}.weight" if self.layer_prefix else "weight",
             )
@@ -134,29 +127,37 @@ class NVFP4Linear(nn.Linear):
             # and restore the original shape afterwards (tokens are quantized
             # independently along the last/feature dim, so ordering is irrelevant).
             act_prefix = f"{self.layer_prefix}.input" if self.layer_prefix else "input"
-            orig_shape = x_eff.shape
+            orig_shape = self.x_eff.shape
             xq3d = NVFP4ActivationQuantization.apply(
-                x_eff.reshape(orig_shape[0], -1, orig_shape[-1]),
+                self.x_eff.reshape(orig_shape[0], -1, orig_shape[-1]),
                 self.block_size,
                 quantization_error_info, act_prefix,
             )
-            xq = xq3d.reshape(orig_shape)
+            self.x_quant = xq3d.reshape(orig_shape)
         else:
-            Wq = W_eff
-            xq = x_eff
-        return F.linear(xq, Wq, self.bias)
+            self.W_quant = self.W_eff
+            self.x_quant = self.x_eff
+        self.output = F.linear(self.x_quant, self.W_quant, self.bias)
+        return self.output
+
+    def get_differentiable_quantization_error(self, loss_fn):
+        return loss_fn(self.x_quant.detach(), self.x_eff), loss_fn(self.W_quant.detach(), self.W_eff)
 
 
 
 if __name__ == "__main__":
     
     import torch
+    import matplotlib.pyplot as plt
+    import numpy as np
 
     batch_size = 10
+    seq_len = 20
     hidden_dim_1 = 30
     hidden_dim_2 = 40
-    x = torch.randn(batch_size, hidden_dim_1)
-
+    x = torch.randn(batch_size, seq_len, hidden_dim_1)
+    """
+    # Test QuantizedLinear
     linear = QuantizedLinear(hidden_dim_1, hidden_dim_2, bitW=8, bitA=8)
     y = linear(x)
     # print(y.shape)
@@ -167,3 +168,21 @@ if __name__ == "__main__":
     print(linear.parameter_right_threshold.grad.shape)
     # print(linear.activation_left_threshold.grad.shape)
     # print(linear.activation_right_threshold.grad.shape)
+    """
+    # ---
+    # Test NVFP4Linear
+    # ---
+    with torch.no_grad():
+        linear_ori = nn.Linear(hidden_dim_1, hidden_dim_2, bias=True)
+        y_ori = linear_ori(x)
+    ## Test Rotation and Permutation
+    # rots = ["identity", "random", "hadamard", "cayley"]
+    # perms = ["identity", "random", "mag"]
+    # for rot in rots:
+    #     for perm in perms:
+    #         for quantize in [False]:
+    #             quantization_error_info = {}
+    #             linear_rpq = NVFP4Linear(hidden_dim_1, hidden_dim_2, rotation=rot, permutation=perm, quantize=quantize, bias=True, block_size=16)
+    #             linear_rpq.load_state_dict(linear_ori.state_dict())
+    #             y_rpq = linear_rpq(x, quantization_error_info)
+    #             print(f"{rot}-{perm}-{quantize}: {torch.mean(torch.abs(y_rpq - y_ori))}") 

@@ -21,11 +21,13 @@ if _project_root not in sys.path:
 
 import torch
 
-from src.data.mnist import get_mnist_dataloader, visualize_mnist_samples
+from src.data.mnist import get_mnist_dataloader
+from src.data.cifar import get_cifar100_dataloader
 
 from src.data.t2i import (  # noqa: F401 – re-export everything
     LatentDataset,
     RawImageDataset,
+    _build_paths_and_captions,
     load_t2i_data,
     load_t2i_data_raw,
     load_t2i_data_tokenized,
@@ -40,7 +42,7 @@ from src.data.t2i import (  # noqa: F401 – re-export everything
 # Dataset name classification
 # ---------------------------------------------------------------------------
 
-_T2I_DATASETS = {"pokemon", "coco", "flickr30k", "cc12m"}
+_T2I_DATASETS = {"pokemon", "coco", "flickr30k", "cc12m", "mjhq-30k"}
 _DEFAULT_TOKEN_LENGTHS = {"quantized_sd3": 77, "quantized_pixart": 300}
 
 
@@ -98,7 +100,7 @@ def get_dataloader(
     dataset_name_lower = dataset_name.lower()
 
     # ── MNIST ──────────────────────────────────────────────────────────
-    if dataset_name_lower == "mnist":
+    if dataset_name == "mnist":
         mnist_cfg = {
             "batch_size": dataset_config.get("batch_size", 128),
             "data_dir": dataset_config.get("data_dir", "./data"),
@@ -109,8 +111,19 @@ def get_dataloader(
         val_loader = get_mnist_dataloader(**mnist_cfg, train=False)
         return train_loader, val_loader
 
+    elif dataset_name == "cifar100":
+        cifar100_cfg = {
+            "batch_size": dataset_config.get("batch_size", 128),
+            "data_dir": dataset_config.get("data_dir", "./data"),
+            "num_workers": dataset_config.get("num_workers", 0),
+            "pin_memory": dataset_config.get("pin_memory", False),
+        }
+        train_loader = get_cifar100_dataloader(**cifar100_cfg, train=True)
+        val_loader = get_cifar100_dataloader(**cifar100_cfg, train=False)
+        return train_loader, val_loader
+
     # ── T2I ────────────────────────────────────────────────────────────
-    if dataset_name_lower in _T2I_DATASETS:
+    elif dataset_name_lower in _T2I_DATASETS:
         if vae is None or tokenizer is None:
             raise ValueError(
                 f"T2I dataset '{dataset_name}' requires both vae and tokenizer. "
@@ -142,6 +155,39 @@ def get_dataloader(
     raise ValueError(
         f"Unknown dataset '{dataset_name}'. "
         f"Supported: mnist, {', '.join(sorted(_T2I_DATASETS))}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt-based calibration dataloader
+# ---------------------------------------------------------------------------
+
+def get_dataloader_prompt(
+    dataset_name: str,
+    dataset_path: str,
+    n_sample: int,
+) -> torch.utils.data.DataLoader:
+
+    image_paths, captions, tmpdir = _build_paths_and_captions(
+        dataset_name, max_total=n_sample, dataset_path=dataset_path,
+    )
+        
+    class PromptDataset(torch.utils.data.Dataset):
+        def __init__(self, prompts_list):
+            self.prompts = prompts_list
+        
+        def __len__(self):
+            return 1
+        
+        def __getitem__(self, idx):
+            return self.prompts
+    
+    return torch.utils.data.DataLoader(
+        PromptDataset(captions),
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=lambda batch: batch[0],
     )
 
 
@@ -190,6 +236,7 @@ if __name__ == "__main__":
     """
 
     # ── Test 2: T2I with RandomVAE + RandomTokenizer ──
+    """
     print("=" * 60)
     print("Test 2: T2I (pokemon) via get_dataloader (dry-run VAE/tokenizer)")
 
@@ -260,4 +307,15 @@ if __name__ == "__main__":
     print(f"  attention_mask shape: {tuple(tokens['attention_mask'].shape)}")
     print()
 
-    print("All data_loader tests passed!")
+    """
+
+    # Test prompt loading
+    """
+    calibrate_dataloader = get_dataloader_prompt(
+        "mjhq30k",
+        r"G://datasets//MJHQ-30K",
+        8
+    )
+    for prompt in calibrate_dataloader:
+        print(prompt)
+    """

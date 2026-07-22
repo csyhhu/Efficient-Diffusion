@@ -170,6 +170,22 @@ class FlowMatchingScheduler:
         """v_t = x_1 - x_0."""
         return x_1 - x_0
 
+    def step(self, noise_pred, timestep, sample, return_dict=False):
+        """Euler step for flow matching sampling.
+        
+        Args:
+            noise_pred: Predicted velocity (or noise) from the model
+            timestep: Current timestep
+            sample: Current sample (x_t)
+            return_dict: Whether to return a dict or tuple
+            
+        Returns:
+            (next_sample, denoised) tuple or dict
+        """
+        dt = -1.0 / 50
+        next_sample = sample + noise_pred * dt
+        return (next_sample, next_sample) if not return_dict else {"prev_sample": next_sample, "denoised": next_sample}
+
 
 # ============================================================================
 # Consistency Model (CM) — EDM noise schedule, data-prediction

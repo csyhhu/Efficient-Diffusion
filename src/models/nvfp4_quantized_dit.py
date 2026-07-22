@@ -17,65 +17,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# supports both package import and direct script execution
-try:
-    from ..quant_utils.quantization import NVFP4Quantization, NVFP4ActivationQuantization
-except ImportError:
-    import sys, os
-    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, _src)
-    from quant_utils.quantization import NVFP4Quantization, NVFP4ActivationQuantization
 
-
-# ===========================================================================
-# NVFP4 Module Helpers
-# ===========================================================================
-
-class NVFP4Linear(nn.Linear):
-    """Linear layer with NVFP4 quantization on both weight and input activation.
-
-    - Weight:      quantized with NVFP4Quantization  (tensor-wise).
-    - Activation:  quantized with NVFP4ActivationQuantization (token-wise)
-                   for 3D inputs [bs, n_seq, dim], or NVFP4Quantization
-                   (tensor-wise) for 2D inputs [bs, dim].
-
-    Args:
-        in_features, out_features: standard nn.Linear args.
-        bias: whether to use bias.
-        block_size: elements per NVFP4 scaling block (default 16).
-        layer_prefix: optional string prefix for error_info_ keys.
-    """
-
-    def __init__(self, in_features, out_features, bias=True,
-                 block_size=16, layer_prefix=None):
-        super().__init__(in_features, out_features, bias=bias)
-        self.block_size = block_size
-        self.layer_prefix = layer_prefix
-
-    def forward(self, x, quantization_error_info=None):
-        prefix = f"{self.layer_prefix}." if self.layer_prefix else ""
-
-        # --- Quantize weight (tensor-wise) ---
-        quantized_weight = NVFP4Quantization.apply(
-            self.weight, self.block_size,
-            quantization_error_info, prefix + 'weight'
-        )
-
-        # --- Quantize activation ---
-        if x.dim() == 3:
-            # Token-wise quantization for transformer activations
-            quantized_x = NVFP4ActivationQuantization.apply(
-                x, self.block_size,
-                quantization_error_info, prefix + 'input'
-            )
-        else:
-            # Tensor-wise quantization (e.g. time embedding, 2D input)
-            quantized_x = NVFP4Quantization.apply(
-                x, self.block_size,
-                quantization_error_info, prefix + 'input'
-            )
-
-        return F.linear(quantized_x, quantized_weight, self.bias)
+from src.modules.quantized_linear import NVFP4Linear
+from src.quant_utils.quantization import NVFP4Quantization, NVFP4ActivationQuantization
+from src.quant_utils.rotation import make_rotation
+from src.quant_utils.permutation import make_permutation
 
 
 class NVFP4MultiHeadAttention(nn.MultiheadAttention):
@@ -89,12 +35,19 @@ class NVFP4MultiHeadAttention(nn.MultiheadAttention):
         embed_dim, num_heads, ...: standard nn.MultiheadAttention args.
         block_size: elements per NVFP4 scaling block (default 16).
         layer_prefix: optional string prefix for error_info_ keys.
+        rotation: Rotation type or instance (not used in attention, passed for compatibility).
+        permutation: Permutation type or instance (not used in attention, passed for compatibility).
+        quantize: Whether to apply quantization (not used in attention, passed for compatibility).
     """
 
     def __init__(self, embed_dim, num_heads, block_size=16,
-                 layer_prefix=None, **kwargs):
+                 layer_prefix=None, rotation=None, permutation=None,
+                 quantize=True, **kwargs):
         self.block_size = block_size
         self.layer_prefix = layer_prefix
+        self.rotation = rotation
+        self.permutation = permutation
+        self.quantize = quantize
         super().__init__(embed_dim, num_heads, **kwargs)
 
     def forward(self, query, key, value, key_padding_mask=None,
@@ -276,16 +229,21 @@ class SinusoidalTimeEmbedding(nn.Module):
     """Sinusoidal positional encoding → small NVFP4-quantized MLP."""
 
     def __init__(self, dim: int, max_period: int = 10000,
-                 block_size: int = 16, layer_prefix: str = None):
+                 block_size: int = 16, layer_prefix: str = None,
+                 rotation=None, permutation=None, quantize=True):
         super().__init__()
         self.dim = dim
         self.max_period = max_period
         self.mlp = nn.Sequential(
             NVFP4Linear(dim, dim * 4, block_size=block_size,
-                        layer_prefix=f"{layer_prefix}.mlp.0"),
+                        layer_prefix=f"{layer_prefix}.mlp.0",
+                        rotation=rotation, permutation=permutation,
+                        quantize=quantize),
             nn.SiLU(),
             NVFP4Linear(dim * 4, dim, block_size=block_size,
-                        layer_prefix=f"{layer_prefix}.mlp.1"),
+                        layer_prefix=f"{layer_prefix}.mlp.1",
+                        rotation=rotation, permutation=permutation,
+                        quantize=quantize),
         )
         self.layer_prefix = layer_prefix
 
@@ -314,13 +272,16 @@ class AdaLNZeo(nn.Module):
     """Adaptive LayerNorm with zero-initialized residual scaling (NVFP4)."""
 
     def __init__(self, time_dim: int, hidden_dim: int,
-                 block_size: int = 16, layer_prefix: str = None):
+                 block_size: int = 16, layer_prefix: str = None,
+                 rotation=None, permutation=None, quantize=True):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
         self.head = nn.Sequential(
             nn.SiLU(),
             NVFP4Linear(time_dim, hidden_dim * 3, block_size=block_size,
-                        layer_prefix=f"{layer_prefix}.head"),
+                        layer_prefix=f"{layer_prefix}.head",
+                        rotation=rotation, permutation=permutation,
+                        quantize=quantize),
         )
         # Zero-init the output bias so that at t=0 the residual is identity
         nn.init.zeros_(self.head[1].weight)
@@ -349,25 +310,36 @@ class DiTBlock(nn.Module):
 
     def __init__(self, hidden_dim: int, num_heads: int, time_dim: int,
                  mlp_ratio: float = 4.0, block_size: int = 16,
-                 layer_prefix: str = None):
+                 layer_prefix: str = None, rotation=None, permutation=None,
+                 quantize=True):
         super().__init__()
         mlp_dim = int(hidden_dim * mlp_ratio)
 
         self.adaln1 = AdaLNZeo(time_dim, hidden_dim, block_size=block_size,
-                               layer_prefix=f"{layer_prefix}.adaln1")
+                               layer_prefix=f"{layer_prefix}.adaln1",
+                               rotation=rotation, permutation=permutation,
+                               quantize=quantize)
         self.attn = NVFP4MultiHeadAttention(
             hidden_dim, num_heads, batch_first=True,
             block_size=block_size,
-            layer_prefix=f"{layer_prefix}.attn"
+            layer_prefix=f"{layer_prefix}.attn",
+            rotation=rotation, permutation=permutation,
+            quantize=quantize
         )
         self.adaln2 = AdaLNZeo(time_dim, hidden_dim, block_size=block_size,
-                               layer_prefix=f"{layer_prefix}.adaln2")
+                               layer_prefix=f"{layer_prefix}.adaln2",
+                               rotation=rotation, permutation=permutation,
+                               quantize=quantize)
         self.mlp = nn.Sequential(
             NVFP4Linear(hidden_dim, mlp_dim, block_size=block_size,
-                        layer_prefix=f"{layer_prefix}.mlp.0"),
+                        layer_prefix=f"{layer_prefix}.mlp.0",
+                        rotation=rotation, permutation=permutation,
+                        quantize=quantize),
             nn.GELU(),
             NVFP4Linear(mlp_dim, hidden_dim, block_size=block_size,
-                        layer_prefix=f"{layer_prefix}.mlp.1"),
+                        layer_prefix=f"{layer_prefix}.mlp.1",
+                        rotation=rotation, permutation=permutation,
+                        quantize=quantize),
         )
         self.layer_prefix = layer_prefix
 
@@ -378,6 +350,109 @@ class DiTBlock(nn.Module):
         attn_out, _ = self.attn(modulated, modulated, modulated,
                                 quantization_error_info=quantization_error_info)
         x = x + gate * attn_out
+
+        # MLP with adaLN
+        modulated, gate = self.adaln2(x, t_emb, quantization_error_info)
+        for module in self.mlp:
+            if isinstance(module, NVFP4Linear):
+                modulated = module(modulated, quantization_error_info)
+            else:
+                modulated = module(modulated)
+        x = x + gate * modulated
+
+        return x
+
+
+class DiTCrossAttentionBlock(nn.Module):
+    """One transformer block with self-attention, cross-attention, and adaLN-Zero (NVFP4)."""
+
+    def __init__(self, hidden_dim: int, num_heads: int, time_dim: int,
+                 mlp_ratio: float = 4.0, cross_attention_dim: int = 768,
+                 block_size: int = 16, layer_prefix: str = None,
+                 rotation=None, permutation=None, quantize=True):
+        super().__init__()
+        mlp_dim = int(hidden_dim * mlp_ratio)
+
+        self.adaln1 = AdaLNZeo(time_dim, hidden_dim, block_size=block_size,
+                               layer_prefix=f"{layer_prefix}.adaln1",
+                               rotation=rotation, permutation=permutation,
+                               quantize=quantize)
+        self.self_attn = NVFP4MultiHeadAttention(
+            hidden_dim, num_heads, batch_first=True,
+            block_size=block_size,
+            layer_prefix=f"{layer_prefix}.self_attn",
+            rotation=rotation, permutation=permutation,
+            quantize=quantize
+        )
+
+        self.adaln_cross = AdaLNZeo(time_dim, hidden_dim, block_size=block_size,
+                                    layer_prefix=f"{layer_prefix}.adaln_cross",
+                                    rotation=rotation, permutation=permutation,
+                                    quantize=quantize)
+        self.cross_attn = NVFP4MultiHeadAttention(
+            hidden_dim, num_heads, batch_first=True,
+            block_size=block_size,
+            layer_prefix=f"{layer_prefix}.cross_attn",
+            rotation=rotation, permutation=permutation,
+            quantize=quantize
+        )
+
+        if cross_attention_dim != hidden_dim:
+            self.k_proj = NVFP4Linear(cross_attention_dim, hidden_dim,
+                                      block_size=block_size,
+                                      layer_prefix=f"{layer_prefix}.k_proj",
+                                      rotation=rotation, permutation=permutation,
+                                      quantize=quantize)
+            self.v_proj = NVFP4Linear(cross_attention_dim, hidden_dim,
+                                      block_size=block_size,
+                                      layer_prefix=f"{layer_prefix}.v_proj",
+                                      rotation=rotation, permutation=permutation,
+                                      quantize=quantize)
+        else:
+            self.k_proj = None
+            self.v_proj = None
+
+        self.adaln2 = AdaLNZeo(time_dim, hidden_dim, block_size=block_size,
+                               layer_prefix=f"{layer_prefix}.adaln2",
+                               rotation=rotation, permutation=permutation,
+                               quantize=quantize)
+        self.mlp = nn.Sequential(
+            NVFP4Linear(hidden_dim, mlp_dim, block_size=block_size,
+                        layer_prefix=f"{layer_prefix}.mlp.0",
+                        rotation=rotation, permutation=permutation,
+                        quantize=quantize),
+            nn.GELU(),
+            NVFP4Linear(mlp_dim, hidden_dim, block_size=block_size,
+                        layer_prefix=f"{layer_prefix}.mlp.1",
+                        rotation=rotation, permutation=permutation,
+                        quantize=quantize),
+        )
+        self.layer_prefix = layer_prefix
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor,
+                encoder_hidden_states: torch.Tensor = None,
+                quantization_error_info: dict = None) -> torch.Tensor:
+        if quantization_error_info is None:
+            quantization_error_info = {}
+
+        # Self-attention with adaLN
+        modulated, gate = self.adaln1(x, t_emb, quantization_error_info)
+        attn_out, _ = self.self_attn(modulated, modulated, modulated,
+                                      quantization_error_info=quantization_error_info)
+        x = x + gate * attn_out
+
+        # Cross-attention with adaLN
+        modulated, gate = self.adaln_cross(x, t_emb, quantization_error_info)
+        if encoder_hidden_states is not None:
+            if self.k_proj is not None:
+                k = self.k_proj(encoder_hidden_states, quantization_error_info)
+                v = self.v_proj(encoder_hidden_states, quantization_error_info)
+            else:
+                k = encoder_hidden_states
+                v = encoder_hidden_states
+            cross_out, _ = self.cross_attn(modulated, k, v,
+                                           quantization_error_info=quantization_error_info)
+            x = x + gate * cross_out
 
         # MLP with adaLN
         modulated, gate = self.adaln2(x, t_emb, quantization_error_info)
@@ -403,6 +478,9 @@ class NVFP4DiT(nn.Module):
     NVFP4ActivationQuantization (token-wise).  2D activations (e.g. time
     embedding MLP) use NVFP4Quantization (tensor-wise).
 
+    Optionally applies rotation and/or permutation on the feature dimension
+    before quantization to improve quantization accuracy.
+
     Args:
         in_channels:   number of input image channels (1 for MNIST).
         image_size:    spatial size of the input image (28 for MNIST).
@@ -413,6 +491,9 @@ class NVFP4DiT(nn.Module):
         time_dim:      dimension of the sinusoidal time embedding.
         mlp_ratio:     MLP hidden / transformer hidden ratio.
         block_size:    elements per NVFP4 scaling block (default 16).
+        rotation:      Rotation type or instance (none/identity/hadamard/random/cayley).
+        permutation:   Permutation type or instance (none/identity/random/mag).
+        use_nvfp4:     Whether to enable NVFP4 quantization (default True).
     """
 
     def __init__(
@@ -426,7 +507,11 @@ class NVFP4DiT(nn.Module):
         time_dim: int = 256,
         mlp_ratio: float = 4.0,
         block_size: int = 16,
-        **kwargs,  # accept (and ignore) bitW/bitA/bitG etc. for config compatibility
+        rotation=None,
+        permutation=None,
+        use_nvfp4=True,
+        use_cross_attention: bool = False,
+        cross_attention_dim: int = 768,
     ):
         super().__init__()
         assert image_size % patch_size == 0, \
@@ -434,11 +519,15 @@ class NVFP4DiT(nn.Module):
         self.patch_size = patch_size
         self.num_patches = (image_size // patch_size) ** 2
         patch_dim = in_channels * patch_size * patch_size  # 16 for MNIST
+        self.use_cross_attention = use_cross_attention
+        self.cross_attention_dim = cross_attention_dim
 
         # Patch embedding: (B, C, H, W) → (B, num_patches, hidden_dim)
         self.patch_embed = NVFP4Linear(
             patch_dim, hidden_dim, block_size=block_size,
-            layer_prefix="patch_embed"
+            layer_prefix="patch_embed",
+            rotation=rotation, permutation=permutation,
+            quantize=use_nvfp4
         )
 
         # Learnable positional embedding
@@ -447,20 +536,44 @@ class NVFP4DiT(nn.Module):
 
         # Time embedding
         self.time_embed = SinusoidalTimeEmbedding(
-            time_dim, block_size=block_size, layer_prefix="time_embed")
+            time_dim, block_size=block_size, layer_prefix="time_embed",
+            rotation=rotation, permutation=permutation,
+            quantize=use_nvfp4)
+
+        if use_cross_attention:
+            self.text_proj = NVFP4Linear(
+                cross_attention_dim, time_dim, block_size=block_size,
+                layer_prefix="text_proj",
+                rotation=rotation, permutation=permutation,
+                quantize=use_nvfp4)
 
         # Transformer blocks
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, num_heads, time_dim, mlp_ratio,
-                     block_size=block_size,
-                     layer_prefix=f"block.{idx}")
-            for idx in range(depth)
-        ])
+        if use_cross_attention:
+            self.blocks = nn.ModuleList([
+                DiTCrossAttentionBlock(hidden_dim, num_heads, time_dim, mlp_ratio,
+                                       cross_attention_dim=cross_attention_dim,
+                                       block_size=block_size,
+                                       layer_prefix=f"block.{idx}",
+                                       rotation=rotation, permutation=permutation,
+                                       quantize=use_nvfp4)
+                for idx in range(depth)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                DiTBlock(hidden_dim, num_heads, time_dim, mlp_ratio,
+                         block_size=block_size,
+                         layer_prefix=f"block.{idx}",
+                         rotation=rotation, permutation=permutation,
+                         quantize=use_nvfp4)
+                for idx in range(depth)
+            ])
 
         # Final norm + output projection
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.proj = NVFP4Linear(
-            hidden_dim, patch_dim, block_size=block_size, layer_prefix="proj")
+            hidden_dim, patch_dim, block_size=block_size, layer_prefix="proj",
+            rotation=rotation, permutation=permutation,
+            quantize=use_nvfp4)
 
         # Init weights
         nn.init.xavier_uniform_(self.proj.weight)
@@ -470,11 +583,12 @@ class NVFP4DiT(nn.Module):
 
         self.quantization_error_info = {}
         print(f"Initialize NVFP4-Quantized DiT (block_size={block_size}, "
-              f"hidden_dim={hidden_dim}, depth={depth}, heads={num_heads})")
+              f"hidden_dim={hidden_dim}, depth={depth}, heads={num_heads}, "
+              f"use_cross_attention={use_cross_attention})")
 
     def _init_weights(self):
-        # Small init for final proj
-        nn.init.zeros_(self.proj.weight)
+        # Xavier init for final proj
+        nn.init.xavier_uniform_(self.proj.weight)
         for block in self.blocks:
             nn.init.xavier_uniform_(block.mlp[0].weight)  # MLP first layer
             nn.init.zeros_(block.mlp[0].bias)
@@ -500,15 +614,35 @@ class NVFP4DiT(nn.Module):
         x = x.reshape(x.shape[0], C, H, W)
         return x
 
+    def _compute_conditioning_embedding(
+        self,
+        t: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        quantization_error_info: dict = None,
+    ) -> torch.Tensor:
+        if quantization_error_info is None:
+            quantization_error_info = {}
+        c_emb = self.time_embed(t, quantization_error_info)
+        if encoder_hidden_states is not None and self.use_cross_attention:
+            pooled = encoder_hidden_states.mean(dim=1)
+            text_emb = self.text_proj(pooled, quantization_error_info)
+            c_emb = c_emb + text_emb
+        return c_emb
+
     def forward(self, x: torch.Tensor, t: torch.Tensor,
+                encoder_hidden_states: torch.Tensor = None,
                 quantization_error_info: dict = None) -> torch.Tensor:
         """
         Args:
             x: (B, C, H, W) noisy image.
             t: (B,) integer timesteps.
+            encoder_hidden_states: (B, seq_len, dim) text embeddings (optional).
         Returns:
             (B, C, H, W) predicted noise.
         """
+        if quantization_error_info is None:
+            quantization_error_info = {}
+
         B, C, H, W = x.shape
 
         # Patchify
@@ -516,12 +650,15 @@ class NVFP4DiT(nn.Module):
         tokens = self.patch_embed(tokens, quantization_error_info)  # (B, N, hidden_dim)
         tokens = tokens + self.pos_embed                  # add position
 
-        # Time conditioning
-        t_emb = self.time_embed(t, quantization_error_info)  # (B, time_dim)
+        # Conditioning embedding
+        c_emb = self._compute_conditioning_embedding(t, encoder_hidden_states, quantization_error_info)
 
         # Transformer blocks
         for block in self.blocks:
-            tokens = block(tokens, t_emb, self.quantization_error_info)
+            if self.use_cross_attention:
+                tokens = block(tokens, c_emb, encoder_hidden_states, quantization_error_info)
+            else:
+                tokens = block(tokens, c_emb, quantization_error_info)
 
         # Output projection
         tokens = self.final_norm(tokens)
@@ -538,16 +675,112 @@ class NVFP4DiT(nn.Module):
 
 if __name__ == "__main__":
 
-    import torch
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from dit import DiT
+    
+    bs = 2
+    in_channels = 32
+    width = 16
+    height = 16
+    n_txt = 32
+    caption_channels = 512
+    dtype = torch.float32
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}, dtype: {dtype}")
 
-    model = NVFP4DiT()
-    batch_size = 10
-    inputs = torch.rand(batch_size, 1, 28, 28)
-    timestamp = torch.randint(0, 10000, (batch_size,))
-    outputs = model(inputs, timestamp)
-    print("output shape:", outputs.shape)
-    loss = torch.nn.MSELoss()(outputs, torch.randn_like(outputs))
-    loss.backward()
-    print("loss:", loss.item())
-    for layer_name, value in model.quantization_error_info.items():
-        print(layer_name)
+    hidden_states = torch.randn(bs, in_channels, height, width, dtype=dtype).to(device)
+    encoder_hidden_states = torch.randn(bs, n_txt, caption_channels, dtype=dtype).to(device)
+    timestep_embs = torch.randn(bs, dtype=dtype).to(device)
+    guidance = torch.ones(bs, dtype=dtype).to(device) * 1.0
+
+    inner_dim = 128
+    num_attention_heads = 4
+    attention_head_dim = inner_dim // num_attention_heads
+    
+    # Test rotation / permutation consistency
+    model_ori = DiT(
+        in_channels=in_channels,
+        image_size=height,
+        patch_size=2,
+        hidden_dim=inner_dim,
+        depth=6,
+        num_heads=num_attention_heads,
+        use_cross_attention=True,
+        cross_attention_dim=caption_channels
+    ).to(device, dtype=dtype)
+    y_ori = model_ori(hidden_states, timestep_embs, encoder_hidden_states=encoder_hidden_states)
+    # print(f"Original model output shape: {y_ori.shape}")
+    """
+    rots = [None, "identity", "hadamard", "cayley"]
+    perms = [None, "identity"]
+    for rot in rots:
+        for perm in perms:
+            for quantize in [False]: 
+                model_rpq = NVFP4DiT(
+                    in_channels=in_channels,
+                    image_size=height,
+                    patch_size=2,
+                    hidden_dim=inner_dim,
+                    depth=6,
+                    num_heads=num_attention_heads,
+                    use_nvfp4=quantize,
+                    rotation=rot,
+                    permutation=perm,
+                ).to(device, dtype=dtype)
+                model_rpq.load_state_dict(model_ori.state_dict(), strict=False)
+                y_rpq = model_rpq(hidden_states, timestep_embs)
+                # print(f"Quantized model output shape: {y_rpq.shape}")
+                
+                diff = torch.mean(torch.abs(y_rpq - y_ori))
+                print(f"[{rot}-{perm}-{quantize}] Diff between original and quantized model: {diff}")
+
+    print("\nTesting Cayley rotation orthogonality...")
+    model_rpq = NVFP4DiT(
+        in_channels=in_channels,
+        image_size=height,
+        patch_size=2,
+        hidden_dim=inner_dim,
+        depth=2,
+        num_heads=num_attention_heads,
+        use_nvfp4=False,
+        rotation="cayley",
+        permutation="identity",
+    ).to(device, dtype=dtype)
+    
+    from quant_utils.rotation import CayleyRotation
+    for name, module in model_rpq.named_modules():
+        if isinstance(module, NVFP4Linear) and isinstance(module.rotation, CayleyRotation):
+            rot = module.rotation
+            if rot.K is None:
+                rot.init_k()
+                rot.K.data = torch.randn_like(rot.K) * 0.01
+            R = rot.rotation
+            ortho_error = torch.mean(torch.abs(R @ R.T - torch.eye(R.shape[0], device=R.device)))
+            print(f"{name:<20s}: rotation shape={R.shape}, orthogonality error={ortho_error.item():.6f}")
+    """
+    # Test whether rotation is treated as a parameter
+    # """
+    model_rpq = NVFP4DiT(
+        in_channels=in_channels,
+        image_size=height,
+        patch_size=2,
+        hidden_dim=inner_dim,
+        depth=6,
+        num_heads=num_attention_heads,
+        use_nvfp4=False,
+        rotation="cayley",
+        permutation="identity",
+    ).to(device, dtype=dtype)
+    y_rpq = model_rpq(hidden_states, timestep_embs, encoder_hidden_states=encoder_hidden_states)
+    # for name, param in model_rpq.named_parameters():
+    #     print(f"{name:<20s}: {param.shape}")
+    # """
+    # Test how to retrieve all NVFP4Linear
+    for name, module in model_rpq.named_modules():
+        if isinstance(module, NVFP4Linear):
+            print(f"{name:<40s}: {module.x_eff.shape}, {module.W_eff.shape}, {module.output.shape}")
+        else:
+            print(f"{name:<40s}: {module}")
+            
+            

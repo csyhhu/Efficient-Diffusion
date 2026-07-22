@@ -31,7 +31,6 @@ python main.py `
     --output_dir=Results/mnist_quantized_dit_fm
 ```
 
-
 ## Pre Study
 
 ### Visualization
