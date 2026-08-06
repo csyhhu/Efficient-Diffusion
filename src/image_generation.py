@@ -1011,9 +1011,10 @@ class ImageGeneration:
     
 
     def calibrate_cayley(
-        self, calibrate_dataset_name=None, cali_dataloader=None, 
-        prompt=None, n_batches=8, iters=200, lr=0.01, 
-        criterion="step-wise", num_steps=4, save_path = None, test_mode=False
+        self, 
+        calibrate_dataset_name=None, cali_dataloader=None, iters=200, lr=0.01, 
+        criterion="step-wise", num_steps=4, 
+        save_path = None, test_mode=False
     ):
         """
         Calibrate Cayley rotation using different criteria for loss computation.
@@ -1062,14 +1063,6 @@ class ImageGeneration:
         
         calib_batch = next(iter(cali_dataloader))
         
-        all_error_info = {
-            'module_wise_loss': [],
-            'layer_wise_loss': [],
-            'step_wise_loss': [],
-            'final_loss': [],
-            'loss_history': [],
-        }
-        
         for iter_idx in range(iters):
             
             optimizer.zero_grad()
@@ -1105,7 +1098,8 @@ class ImageGeneration:
                 raise ValueError(f"Data type {type(calib_batch)} is not supported")
 
             latents, error_info, loss = self.compute_distillation_loss(
-                ref_model, batch_data, criterion, num_steps
+                ref_model, batch_data, criterion, num_steps, 
+                single_step_mode=single_step_mode
             )
             
             loss_val = loss.item()
@@ -1114,36 +1108,9 @@ class ImageGeneration:
             
             pbar.set_postfix({"Loss": f"{loss_val:.6f}"})
             pbar.update(1)
-            # Pack loss infomation
-            all_error_info['loss_history'].append(loss_val)
             
             del loss
             torch.cuda.empty_cache()
-            
-            iter_module_wise = {}
-            iter_layer_wise = {}
-            iter_step_wise = {}
-            
-            for step_idx in range(num_steps):
-                if step_idx in error_info:
-                    step_data = error_info[step_idx]
-                    iter_module_wise[step_idx] = {}
-                    iter_layer_wise[step_idx] = {}
-                    iter_step_wise[step_idx] = step_data['step_loss']
-                    
-                    for module_name, module_data in step_data['module_loss'].items():
-                        iter_module_wise[step_idx][module_name] = {
-                            'act': module_data['act'],
-                            'param': module_data['param']
-                        }
-                    
-                    for layer_name, layer_loss in step_data['layer_loss'].items():
-                        iter_layer_wise[step_idx][layer_name] = layer_loss
-            
-            all_error_info['module_wise_loss'].append(iter_module_wise)
-            all_error_info['layer_wise_loss'].append(iter_layer_wise)
-            all_error_info['step_wise_loss'].append(iter_step_wise)
-            all_error_info['final_loss'].append(error_info['final'])
         
         pbar.close()
         
@@ -1152,7 +1119,7 @@ class ImageGeneration:
             os.makedirs(save_path, exist_ok=True)
             error_path = os.path.join(save_path, "cayley_error_info.json")
             with open(error_path, 'w') as f:
-                json.dump(all_error_info, f, indent=2)
+                json.dump(error_info, f, indent=2)
             print(f"Error info saved to: {error_path}")
         
         if test_mode:
@@ -1163,7 +1130,7 @@ class ImageGeneration:
             from src.utils import save_sample_grid
             save_sample_grid(images, os.path.join(save_path, "test_images.png"), nrow=1)
 
-        return all_error_info
+        return error_info
     
     def build_reference_model(self):
         """Build a reference model with the same weights but no quantization."""
@@ -1191,6 +1158,11 @@ class ImageGeneration:
         
         Args:
             stats: Dictionary containing all error metrics from calibrate_cayley
+                   Expected structure:
+                   {
+                       0: {"module_loss": {...}, "layer_loss": {...}, "step_loss": ...},
+                       'final': ...
+                   }
             save_path: Directory to save the plot (if None, displays only)
         """
         import matplotlib
@@ -1201,31 +1173,26 @@ class ImageGeneration:
             print(f"Load error info from {stats}")
             stats = json.load(open(stats))
 
-        module_wise_loss = stats.get('module_wise_loss', [])
-        layer_wise_loss = stats.get('layer_wise_loss', [])
-        step_wise_loss = stats.get('step_wise_loss', [])
-        final_loss = stats.get('final_loss', [])
-
-        # print(module_wise_loss)
-        # print(layer_wise_loss)
-        # print(step_wise_loss)
-        # print(final_loss)
+        step_keys = [k for k in stats.keys() if isinstance(k, int)]
+        step_keys.sort()
         
-        if not module_wise_loss:
-            print("Warning: module_wise_loss is empty")
+        if not step_keys:
+            print("Warning: No step data found in stats")
             return
         
-        num_steps = len(module_wise_loss[0]) if module_wise_loss else 0
-        num_iters = len(module_wise_loss)
-        
-        step_keys = list(module_wise_loss[0].keys()) if module_wise_loss else []
-        
         fig, axes = plt.subplots(1, 1, figsize=(10, 6))
-        axes.plot(final_loss, label='Final Loss')
-        axes.set_xlabel('Iteration')
+        
+        for step_idx in step_keys:
+            step_data = stats.get(step_idx, {})
+            step_loss = step_data.get('step_loss', 0)
+            axes.scatter(step_idx, step_loss, label=f'Step {step_idx}', s=50)
+        
+        final_loss = stats.get('final', 0)
+        axes.axhline(y=final_loss, color='r', linestyle='--', label='Final Loss')
+        
+        axes.set_xlabel('Step')
         axes.set_ylabel('Loss')
-        axes.set_title('Final Loss')
-        # axes.set_yscale('log')
+        axes.set_title('Step-wise Loss')
         axes.legend()
         axes.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -1233,119 +1200,38 @@ class ImageGeneration:
         save_path = f"{save_root}/cayley_loss"
         if save_path is not None:
             os.makedirs(save_path, exist_ok=True)
-            plot_path = os.path.join(save_path, "cayley_final_loss.png")
+            plot_path = os.path.join(save_path, "cayley_step_loss.png")
             plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-            print(f"Final loss plot saved to: {plot_path}")
+            print(f"Step loss plot saved to: {plot_path}")
         plt.close()
         
-        for step_idx in range(num_steps):
-            step_key = str(step_idx) if step_keys and isinstance(step_keys[0], str) else step_idx
-            modules_in_step = set()
-            for iter_data in module_wise_loss:
-                if step_key in iter_data:
-                    modules_in_step.update(iter_data[step_key].keys())
-            # print(modules_in_step)
-            if not modules_in_step:
-                continue
-            
-            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-            
-            for module_name in list(modules_in_step)[:10]:
-                act_errors = []
-                param_errors = []
-                for iter_data in module_wise_loss:
-                    if step_key in iter_data and module_name in iter_data[step_key]:
-                        act_errors.append(iter_data[step_key][module_name]['act'])
-                        param_errors.append(iter_data[step_key][module_name]['param'])
-                    else:
-                        act_errors.append(0.0)
-                        param_errors.append(0.0)
-                axes[0].plot(act_errors, label=module_name, alpha=0.7)
-                axes[0].set_xticks(range(len(act_errors))) 
-                axes[1].plot(param_errors, label=module_name, alpha=0.7)
-                axes[1].set_xticks(range(len(param_errors))) 
-            
-            axes[0].set_xlabel('Iteration')
-            axes[0].set_ylabel('Activation Quantization Loss')
-            axes[0].set_title(f'Module-wise Activation Loss (Step {step_idx})')
-            axes[0].legend()
-            axes[0].grid(True, alpha=0.3)
-            
-            axes[1].set_xlabel('Iteration')
-            axes[1].set_ylabel('Parameter Quantization Loss')
-            axes[1].set_title(f'Module-wise Parameter Loss (Step {step_idx})')
-            axes[1].legend()
-            axes[1].grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            
-            if save_path is not None:
-                plot_path = os.path.join(save_path, f"cayley_module_wise_step_{step_idx}.png")
-                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-                print(f"Module-wise loss plot (step {step_idx}) saved to: {plot_path}")
-            plt.close()
-        
-        for step_idx in range(num_steps):
-            step_key = str(step_idx) if step_keys and isinstance(step_keys[0], str) else step_idx
-            layers_in_step = set()
-            for iter_data in layer_wise_loss:
-                if step_key in iter_data:
-                    layers_in_step.update(iter_data[step_key].keys())
-            
-            if not layers_in_step:
-                continue
-            
-            fig, axes = plt.subplots(1, 1, figsize=(12, 6))
-            
-            for layer_name in list(layers_in_step)[:10]:
-                layer_errors = []
-                for iter_data in layer_wise_loss:
-                    if step_key in iter_data and layer_name in iter_data[step_key]:
-                        layer_errors.append(iter_data[step_key][layer_name])
-                    else:
-                        layer_errors.append(0.0)
-                axes.plot(layer_errors, label=layer_name, alpha=0.7)
-            
-            axes.set_xlabel('Iteration')
-            axes.set_ylabel('Layer Loss')
-            axes.set_title(f'Layer-wise Loss (Step {step_idx})')
-            axes.legend()
-            axes.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            
-            if save_path is not None:
-                plot_path = os.path.join(save_path, f"cayley_layer_wise_step_{step_idx}.png")
-                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-                print(f"Layer-wise loss plot (step {step_idx}) saved to: {plot_path}")
-            plt.close()
-        
-        for step_idx in range(num_steps):
-            step_key = str(step_idx) if step_keys and isinstance(step_keys[0], str) else step_idx
-            step_errors = []
-            for iter_data in step_wise_loss:
-                if step_key in iter_data:
-                    step_errors.append(iter_data[step_key])
-                else:
-                    step_errors.append(0.0)
-            
-            fig, axes = plt.subplots(1, 1, figsize=(10, 6))
-            axes.plot(step_errors, label=f'Step {step_idx}')
-            axes.set_xticks(range(len(step_errors)))
-            axes.set_xlabel('Iteration')
-            axes.set_ylabel('Step Loss')
-            # axes.set_yscale('log')
-            axes.set_title(f'Step-wise Loss (Step {step_idx})')
-            axes.legend()
-            axes.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            
-            if save_path is not None:
-                plot_path = os.path.join(save_path, f"cayley_step_wise_step_{step_idx}.png")
-                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-                print(f"Step-wise loss plot (step {step_idx}) saved to: {plot_path}")
-            plt.close()
+        if step_keys:
+            module_loss = stats[step_keys[0]].get('module_loss', {})
+            if module_loss:
+                fig, axes = plt.subplots(1, 1, figsize=(12, 6))
+                modules = list(module_loss.keys())
+                act_losses = [module_loss[m].get('act', 0) for m in modules]
+                param_losses = [module_loss[m].get('param', 0) for m in modules]
+                
+                x = range(len(modules))
+                width = 0.35
+                
+                axes.bar([i - width/2 for i in x], act_losses, width, label='Activation Loss')
+                axes.bar([i + width/2 for i in x], param_losses, width, label='Parameter Loss')
+                
+                axes.set_xlabel('Module')
+                axes.set_ylabel('Quantization Error')
+                axes.set_title('Module-wise Quantization Error')
+                axes.legend()
+                axes.grid(True, alpha=0.3)
+                plt.xticks(x, modules, rotation=90)
+                plt.tight_layout()
+                
+                if save_path is not None:
+                    plot_path = os.path.join(save_path, "cayley_module_loss.png")
+                    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                    print(f"Module loss plot saved to: {plot_path}")
+                plt.close()
 
     def compute_distillation_loss(self, ref_model, batch_data, criterion, num_steps, loss_fn=F.mse_loss, single_step_mode=True, **kwargs):
         """
@@ -1362,7 +1248,6 @@ class ImageGeneration:
                               If False, perform full multi-step decoding (higher memory usage).
         """
         timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device)
-        dt = 1.0 / num_steps
         loss_acm_act = torch.tensor(0.0, device=self.device)
         loss_acm_param = torch.tensor(0.0, device=self.device)
         loss_acm_layer_wise = torch.tensor(0.0, device=self.device)
@@ -1371,70 +1256,61 @@ class ImageGeneration:
         
         hidden_states = batch_data.get('x')
         encoder_hidden_states = batch_data.get('encoder_hidden_states')
+        
+        noise = torch.randn_like(hidden_states)
 
         if single_step_mode:
-            return self._compute_single_step_loss(ref_model, batch_data, criterion, num_steps, loss_fn, **kwargs)
+            sampled_step_idx = torch.randint(0, num_steps, (1,)).item()
+            steps_to_run = [sampled_step_idx]
+        else:
+            steps_to_run = range(num_steps)
 
-        latent_target = hidden_states
-        latent_ref = hidden_states.clone().detach()
+        scm_timesteps = None
+        guidance = None
+        if isinstance(self.scheduler, SCMScheduler):
+            guidance_embeds_scale = getattr(getattr(self.transformer, 'config', None), "guidance_embeds_scale", 0.1)
+            guidance = torch.full([hidden_states.shape[0]], kwargs.get("guidance", 4.5), device=self.device, dtype=torch.float32)
+            guidance = guidance.to(self.dtype) * guidance_embeds_scale
 
-        for i in range(num_steps):
+            self.scheduler.set_timesteps(
+                num_steps, device=self.device,
+                max_timesteps=1.5708,
+                intermediate_timesteps=(1.3 if num_steps == 2 else None),
+            )
+            self.scheduler.set_begin_index(0)
+            scm_timesteps = self.scheduler.timesteps[:-1].to(self.device).type(self.dtype)
+
+        for i in steps_to_run:
             step_wise_module_loss_dict = {}
             step_wise_layer_loss_dict = {}  
             
             if isinstance(self.scheduler, FlowMatchingScheduler):
-                t_batch = timesteps[i].expand(latent_target.shape[0])
+                t_batch = timesteps[i].expand(hidden_states.shape[0])
+                t_expanded = t_batch.view(-1, *([1] * (hidden_states.dim() - 1)))
+                x_t = (1 - t_expanded) * hidden_states + t_expanded * noise
+                
+                model_input_target = x_t
+                model_input_ref = x_t.detach()
+                
                 output_target = self.transformer(
-                    latent_target, t_batch, encoder_hidden_states, 
+                    model_input_target, t_batch, encoder_hidden_states, 
                 )
                 with torch.no_grad():
-                    output_ref = ref_model(latent_ref, t_batch, encoder_hidden_states)
-                
-                for name, module in self.transformer.named_modules():
-                    if isinstance(module, NVFP4Linear):
-                        loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
-                        step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
-                        loss_acm_act += loss_act
-                        loss_acm_param += loss_param
-
-                        loss_layer_wise = loss_fn(output_ref.detach(), output_target)
-                        step_wise_layer_loss_dict[name] = loss_layer_wise.item()
-                        loss_acm_layer_wise += loss_layer_wise
-                
-                loss_step_wise = loss_fn(output_target, output_ref)
-                loss_acm_step_wise += loss_step_wise
-                
-                error_info[i] = {
-                    "module_loss": step_wise_module_loss_dict,
-                    "layer_loss": step_wise_layer_loss_dict,
-                    "step_loss": loss_step_wise.item(),
-                }
-                latent_ref = latent_ref + dt * output_ref
-                latent_target = latent_target + dt * output_target
+                    output_ref = ref_model(model_input_ref, t_batch, encoder_hidden_states)
             
             elif isinstance(self.scheduler, SCMScheduler):
-                sigma_data = float(self.scheduler.config.sigma_data) if hasattr(self.scheduler, 'config') else self._sigma_data
-                guidance_embeds_scale = getattr(getattr(self.transformer, 'config', None), "guidance_embeds_scale", 0.1)
-
-                guidance = torch.full([latent_target.shape[0]], kwargs.get("guidance", 4.5), device=self.device, dtype=torch.float32)
-                guidance = guidance.to(self.dtype) * guidance_embeds_scale
-
-                self.scheduler.set_timesteps(
-                    num_steps, device=self.device,
-                    max_timesteps=1.5708,
-                    intermediate_timesteps=(1.3 if num_steps == 2 else None),
-                )
-                self.scheduler.set_begin_index(0)
-                scm_timesteps = self.scheduler.timesteps[:-1].to(self.device).type(self.dtype)
-
                 t = scm_timesteps[i]
-                timestep = t.expand(latent_target.shape[0])
+                timestep = t.expand(hidden_states.shape[0])
                 scm_t = torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))
                 scm_t = scm_t.to(self.dtype)
                 scm_t_expanded = scm_t.view(-1, 1, 1, 1)
                 
-                model_input_target = latent_target * torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded)**2)
-                model_input_ref = latent_ref * torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded)**2)
+                scale = torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded)**2)
+                x_t = scale * hidden_states + (1 - scale) * noise
+                
+                model_input_target = x_t
+                model_input_ref = x_t.detach()
+                
                 model_input_target = model_input_target.to(self.dtype)
                 model_input_ref = model_input_ref.to(self.dtype)
 
@@ -1459,51 +1335,33 @@ class ImageGeneration:
                             x=model_input_ref, t=scm_t, encoder_hidden_states=encoder_hidden_states,
                         )
 
-                for name, module in self.transformer.named_modules():
-                    if isinstance(module, NVFP4Linear):
-                        loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
-                        step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
-                        loss_acm_act += loss_act
-                        loss_acm_param += loss_param
-
-                        loss_layer_wise = loss_fn(output_ref.detach(), output_target)
-                        step_wise_layer_loss_dict[name] = loss_layer_wise.item()
-                        loss_acm_layer_wise += loss_layer_wise
-
-                loss_step_wise = loss_fn(output_target, output_ref)
-                loss_acm_step_wise += loss_step_wise
-
-                error_info[i] = {
-                    "module_loss": step_wise_module_loss_dict,
-                    "layer_loss": step_wise_layer_loss_dict,
-                    "step_loss": loss_step_wise.item(),
-                }
-
-                noise_pred_target = (
-                    (1 - 2 * scm_t_expanded) * model_input_target
-                    + (1 - 2 * scm_t_expanded + 2 * scm_t_expanded**2) * output_target
-                ) / torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded) ** 2)
-                noise_pred_target = noise_pred_target.float() * sigma_data
-
-                noise_pred_ref = (
-                    (1 - 2 * scm_t_expanded) * model_input_ref
-                    + (1 - 2 * scm_t_expanded + 2 * scm_t_expanded**2) * output_ref
-                ) / torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded) ** 2)
-                noise_pred_ref = noise_pred_ref.float() * sigma_data
-
-                latent_target_scaled, _ = self.scheduler.step(noise_pred_target, timestep, latent_target * sigma_data, return_dict=False)
-                latent_target = (latent_target_scaled / sigma_data).to(self.dtype)
-                with torch.no_grad():
-                    latent_ref_scaled, _ = self.scheduler.step(noise_pred_ref, timestep, latent_ref * sigma_data, return_dict=False)
-                    latent_ref = (latent_ref_scaled / sigma_data).detach()
-
             else:
                 raise ValueError(f"Scheduler type {type(self.scheduler)} is not supported.")
+            
+            for name, module in self.transformer.named_modules():
+                if isinstance(module, NVFP4Linear):
+                    loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
+                    step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
+                    loss_acm_act += loss_act
+                    loss_acm_param += loss_param
+
+                    loss_layer_wise = loss_fn(output_ref.detach(), output_target)
+                    step_wise_layer_loss_dict[name] = loss_layer_wise.item()
+                    loss_acm_layer_wise += loss_layer_wise
+            
+            loss_step_wise = loss_fn(output_target, output_ref)
+            loss_acm_step_wise += loss_step_wise
+            
+            error_info[0 if single_step_mode else i] = {
+                "module_loss": step_wise_module_loss_dict,
+                "layer_loss": step_wise_layer_loss_dict,
+                "step_loss": loss_step_wise.item(),
+            }
         
-        final_loss = loss_fn(latent_ref.detach(), latent_target)
+        final_loss = loss_step_wise
         error_info['final'] = final_loss.item()
 
-        return_dict = [latent_target, error_info]
+        return_dict = [hidden_states, error_info]
         if criterion == "module-wise":
             total_loss = loss_acm_act + loss_acm_param
         elif criterion == "layer-wise":
@@ -1515,146 +1373,4 @@ class ImageGeneration:
         return_dict.append(total_loss)
         return return_dict
 
-    def _compute_single_step_loss(self, ref_model, batch_data, criterion, num_steps, loss_fn=F.mse_loss, **kwargs):
-        """
-        Compute distillation loss at a single randomly sampled timestep (like diffusion training).
-        This significantly reduces memory usage by avoiding multi-step forward passes.
-        
-        Args:
-            ref_model: Reference model (unquantized)
-            batch_data: Dictionary containing input data
-            criterion: Loss criterion ('module-wise', 'layer-wise', 'step-wise')
-            num_steps: Number of diffusion steps
-            loss_fn: Loss function (default: MSE)
-        """
-        timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device)
-        sampled_step_idx = torch.randint(0, num_steps, (1,)).item()
-        
-        hidden_states = batch_data.get('x')
-        encoder_hidden_states = batch_data.get('encoder_hidden_states')
-        
-        error_info = {}
-        loss_acm_act = torch.tensor(0.0, device=self.device)
-        loss_acm_param = torch.tensor(0.0, device=self.device)
-        loss_acm_layer_wise = torch.tensor(0.0, device=self.device)
-        loss_acm_step_wise = torch.tensor(0.0, device=self.device)
-
-        if isinstance(self.scheduler, FlowMatchingScheduler):
-            t_batch = timesteps[sampled_step_idx].expand(hidden_states.shape[0])
-            
-            output_target = self.transformer(hidden_states, t_batch, encoder_hidden_states)
-            
-            with torch.no_grad():
-                output_ref = ref_model(hidden_states, t_batch, encoder_hidden_states)
-
-            step_wise_module_loss_dict = {}
-            step_wise_layer_loss_dict = {}
-            
-            for name, module in self.transformer.named_modules():
-                if isinstance(module, NVFP4Linear):
-                    loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
-                    step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
-                    loss_acm_act += loss_act
-                    loss_acm_param += loss_param
-
-                    loss_layer_wise = loss_fn(output_ref.detach(), output_target)
-                    step_wise_layer_loss_dict[name] = loss_layer_wise.item()
-                    loss_acm_layer_wise += loss_layer_wise
-
-            loss_step_wise = loss_fn(output_target, output_ref)
-            loss_acm_step_wise += loss_step_wise
-
-            error_info[sampled_step_idx] = {
-                "module_loss": step_wise_module_loss_dict,
-                "layer_loss": step_wise_layer_loss_dict,
-                "step_loss": loss_step_wise.item(),
-            }
-            error_info['final'] = loss_step_wise.item()
-            
-            return_dict = [hidden_states, error_info]
-
-        elif isinstance(self.scheduler, SCMScheduler):
-            sigma_data = float(self.scheduler.config.sigma_data) if hasattr(self.scheduler, 'config') else self._sigma_data
-            guidance_embeds_scale = getattr(getattr(self.transformer, 'config', None), "guidance_embeds_scale", 0.1)
-
-            guidance = torch.full([hidden_states.shape[0]], kwargs.get("guidance", 4.5), device=self.device, dtype=torch.float32)
-            guidance = guidance.to(self.dtype) * guidance_embeds_scale
-
-            self.scheduler.set_timesteps(
-                num_steps, device=self.device,
-                max_timesteps=1.5708,
-                intermediate_timesteps=(1.3 if num_steps == 2 else None),
-            )
-            self.scheduler.set_begin_index(0)
-            scm_timesteps = self.scheduler.timesteps[:-1].to(self.device).type(self.dtype)
-
-            t = scm_timesteps[sampled_step_idx]
-            timestep = t.expand(hidden_states.shape[0])
-            scm_t = torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))
-            scm_t = scm_t.to(self.dtype)
-            scm_t_expanded = scm_t.view(-1, 1, 1, 1)
-            
-            model_input = hidden_states * torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded)**2)
-            model_input = model_input.to(self.dtype)
-
-            if hasattr(self.transformer, 'config'):
-                output_target = self.transformer(
-                    hidden_states=model_input,
-                    encoder_hidden_states=encoder_hidden_states,
-                    timestep=scm_t, guidance=guidance, return_dict=False,
-                )[0]
-                with torch.no_grad():
-                    output_ref = ref_model(
-                        hidden_states=model_input,
-                        encoder_hidden_states=encoder_hidden_states,
-                        timestep=scm_t, guidance=guidance, return_dict=False,
-                    )[0]
-            else:
-                output_target = self.transformer(
-                    x=model_input, t=scm_t, encoder_hidden_states=encoder_hidden_states,
-                )
-                with torch.no_grad():
-                    output_ref = ref_model(
-                        x=model_input, t=scm_t, encoder_hidden_states=encoder_hidden_states,
-                    )
-
-            step_wise_module_loss_dict = {}
-            step_wise_layer_loss_dict = {}
-            
-            for name, module in self.transformer.named_modules():
-                if isinstance(module, NVFP4Linear):
-                    loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
-                    step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
-                    loss_acm_act += loss_act
-                    loss_acm_param += loss_param
-
-                    loss_layer_wise = loss_fn(output_ref.detach(), output_target)
-                    step_wise_layer_loss_dict[name] = loss_layer_wise.item()
-                    loss_acm_layer_wise += loss_layer_wise
-
-            loss_step_wise = loss_fn(output_target, output_ref)
-            loss_acm_step_wise += loss_step_wise
-
-            error_info[sampled_step_idx] = {
-                "module_loss": step_wise_module_loss_dict,
-                "layer_loss": step_wise_layer_loss_dict,
-                "step_loss": loss_step_wise.item(),
-            }
-            error_info['final'] = loss_step_wise.item()
-            
-            return_dict = [hidden_states, error_info]
-
-        else:
-            raise ValueError(f"Scheduler type {type(self.scheduler)} is not supported.")
-
-        if criterion == "module-wise":
-            total_loss = loss_acm_act + loss_acm_param
-        elif criterion == "layer-wise":
-            total_loss = loss_acm_layer_wise
-        elif criterion == "step-wise":
-            total_loss = loss_acm_step_wise
-        else:
-            raise ValueError(f"Criterion type {criterion} is not supported.")
-        return_dict.append(total_loss)
-        return return_dict
 

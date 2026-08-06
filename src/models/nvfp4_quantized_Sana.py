@@ -717,8 +717,7 @@ class SanaTransformerBlock(nn.Module):
         norm_hidden_states = self.norm1(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
         norm_hidden_states = norm_hidden_states.to(hidden_states.dtype)
-        attn_output = self.attn1(norm_hidden_states,
-                                 quantization_error_info=quantization_error_info)
+        attn_output = self.attn1(norm_hidden_states, quantization_error_info=quantization_error_info)
         hidden_states = hidden_states + gate_msa * attn_output
 
         # Cross-attention (SDPA)
@@ -889,24 +888,8 @@ class NVFP4QuantizedSana(nn.Module):
             return torch.float32
 
     # ------------------------------------------------------------------
-    # Permutation fitting
-    # ------------------------------------------------------------------
-
-    # def fit_all_permutations(self):
-    #     """Fit every layer's permutation on the CURRENT (real) weights.
-
-    #     Call this after weights are loaded (e.g. ``from_pretrained`` or
-    #     ``_copy_weights``). Rotations are data-free (or pre-fitted by the
-    #     caller) and need no action here.
-    #     """
-    #     for m in self.modules():
-    #         if isinstance(m, NVFP4Linear):
-    #             m.fit_permutation()
-
-    # ------------------------------------------------------------------
     # from_pretrained
     # ------------------------------------------------------------------
-
     @classmethod
     def _resolve_checkpoint_path(cls, pretrained_model_name_or_path: str,
                                  download_source: str = "modelscope",
