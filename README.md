@@ -1,28 +1,26 @@
-# Efficient-Diffusion
+Light weight toolkit and experiment playground for efficient diffusion
 
-Light weight toolkit and experiment playground for efficient diffusion 
-
-## Quick Start
+# Quick Start
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Walkthrough of DDPM and FM
-```python 
+# Walkthrough of DDPM and FM
+```python
 # Training and sample a DDPM using MNIST dataset
-python scripts\mnist_train_ddpm.py
+python -m scripts.mnist_train_ddpm
 ```
 
-```python 
+```python
 # Training and sample a FM using MNIST dataset
-python scripts\mnist_train_fm.py
+python -m scripts.mnist_train_fm
 ```
 
-## Unified Training & Sampling for FP/Quantized using DDPM/FM/CM on Various Benchmark
-```python 
+# Unified Training & Sampling for Full-Precision/Quantized using DDPM/FM/CM on Various Benchmark
+```python
 # Training a Quantized Simple DiT on MNIST dataset using Flow Matching
-python main.py `
+python -m main `
     --model_name=quantized_dit `
     --model_config_path=config/mnist_dit_fm/model.yaml `
     --dataset_name=MNIST `
@@ -31,81 +29,86 @@ python main.py `
     --output_dir=Results/mnist_quantized_dit_fm
 ```
 
-## Pre Study
-
-### Visualization
-```python
-python scripts\quant_visualization.py
+# NVFP4
+## New Model Download
+Download a new model (especially its parameters) and validate.
+```bash
+python -m test.test_model_download_generation
 ```
 
-### Runtime under Optimization (SD v1.5 / CPU / float32 / 5 Trials / Anaomly Removed)
-
-```python
-python scripts\measurement_mse_runtime.py
+## Test ImageGenerator in Newly Download Model
+Test whether ImageGenerator is compatible with newly downloaded model.
+```bash
+python -m test.test_image_generation
 ```
 
-| 方案 | 步数 | 耗时均值 | 耗时 std | 耗时范围 | 加速比 | MSE 均值 | MSE std |
-|------|------|---------|---------|----------|--------|---------|---------|
-| baseline | 25 | 138.0s | 4.8s | [132s, 144s] | 1.0× | — | — |
-| torchao INT8 量化 | 25 | 155.0s | 9.8s | [144s, 166s] | 0.9× | 19.7 | 17.0 |
-| DDIM | 10 | 61.0s | 4.6s | [56s, 67s] | 2.3× | 1607.6 | 487.0 |
-
-- **DDIM** 稳定加速 2.3×（步数从 25 → 10），但 MSE 较高（采样路径差异）
-- **torchao INT8 量化** 精度几乎无损 (MSE=19.7)，但 CPU 上反量化有额外开销，无加速效果
-- **baseline** 第 5 轮出现异常高耗时 (1881.853s)，已从统计中排除（可能由 CPU 降频/后台干扰导致）
-
-#### Alpha Scaning (SD v1.5 / CPU / seed=42 / 25 steps)
-
-```
-python python scripts/quant_comparison.py
+## Rotation / Permutation Test
+After NVFP4 Quantized version of model is generated, test its correctness.
+```bash
+python -m test.test_rotation_permutation
 ```
 
-逐步降低 alpha 以增强量化强度，观察质量退化趋势。alpha=1.0 等价于默认量化，alpha 越低量化越激进（裁剪离群值越多）。
-
-##### INT8 Quantization
-
-| alpha | MSE | SSIM | 质量判断 |
-|-------|-----|------|----------|
-| 1.00 | — | — | baseline（无量化） |
-| 0.90 | 9.2 | 0.9874 | 几乎无损 |
-| 0.80 | 26.7 | 0.9654 | 轻微退化 |
-| **0.70** | **62.0** | **0.9273** | **明显退化，临界点** |
-
-> **结论**: alpha=0.80 是 INT8 的安全量化下限（SSIM > 0.96），alpha=0.70 时 MSE 飙升、SSIM 跌破 0.93。
-
-##### INT4 Quantization
-
-| alpha | MSE | SSIM | 质量判断 |
-|-------|-----|------|----------|
-| 1.00 | 1645.4 | 0.5412 | 严重退化 |
-| 0.95 | 3093.2 | 0.4285 | 严重退化 |
-| 0.90 | 1446.3 | 0.3783 | 严重退化 |
-| 0.85 | 1611.5 | 0.3594 | 严重退化 |
-| 0.80 | 2728.5 | 0.2966 | 严重退化 |
-| 0.75 | 2463.3 | 0.2522 | 严重退化 |
-| 0.70 | 3676.9 | 0.2017 | 严重退化 |
-
-> **结论**: 简单 per-channel INT4（仅 15 个量化级别）对 SD v1.5 完全不可用，SSIM 全部 < 0.55，图像严重劣化。INT4 需要更精细的量化方案（如 group-wise quantization, GPTQ 等）。
-
-> **注意**: torchao 的 `Int4WeightOnlyConfig` (version=2) 依赖 mslk CUDA kernel，CPU 上无法使用。
-
-
-### Distribution of Model Parameters
-
-以`runwayml/stable-diffusion-v1-5`为例，取参数量前3的模块，观察按`dim=0`做group slicing, 观察方差最大最小以及随机group的histogram: 
-
-```python
-python scripts\arch_inspect.py
+## Conduct Caylay Rotation Calibration
+Conudct caylay rotation calibration and save the generated model.
+```bash
+python -m scripts.caylay_calibration --save_root G:/Outputs/Efficient-Diffusion/ckpt/cayley_rotation
 ```
-没有发现明显差异：
 
-![Channel-wise Std Histogram](outputs/images/channel-wise-std-histogram.png)
+# Step-Wise Difference Analysis
 
-对全部参数，观察方差最大最小以及随机group的histogram: 
+Analyze step-to-step differences within a denoising trajectory. See
+[analysis/step_wise_difference/READMD.md](analysis/step_wise_difference/READMD.md)
+for details.
 
-说明该模型各层参数的分布还是比较均匀，不需要做较多额外调整。
+## Save step-wise outputs
+```bash
+python -m analysis.step_wise_difference.save_step_wise_output --model_type sana --model_id "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers" --dataset_name mjhq30k --dataset_path "G://datasets/MJHQ-30K" --n_samples 10 --num_steps 4 --seed 42 --guidance 4.5 --use_nvfp4 --output_dir "G://Outputs//Efficient-Diffusion//step_wise_output//Sana-MJHQ30K-nvfp4"
+```
 
-## DONE & TODO
-- [x] Quantization on Toy Benchmark (MNIST x DiT x DDPM/FM)
-- [] Quantization on Video Generation Methods
-- [] Large scale experiments
+## Analyze
+```bash
+python -m analysis.step_wise_difference.analyze_step_wise_difference --input_dir "G://Outputs//Efficient-Diffusion//step_wise_output//Sana-MJHQ30K-nvfp4" --sample_idx 0
+```
+
+# Evaluation
+
+## Generate Images for Evaluation
+For `identity`, `random`, `hadamard` rotation and `identity`, `random`, `hadamard` permutation:
+```bash
+python -m eval.generate_for_eval `
+    --model_id stabilityai/stable-diffusion-3.5-medium `
+    --quantized --rotation hadamard --permutation identity `
+    --dataset_name coco2017val `
+    --dataset_path G://datasets//coco2017val `
+    --save_root G://Outputs//Efficient-Diffusion//eval_gen/sana-coco2017val-hadamard-identity
+```
+For `cayley` rotation:
+```bash
+python -m eval.generate_for_eval `
+    --model_id stabilityai/stable-diffusion-3.5-medium `
+    --rotation_ckpt_path G://Outputs//Efficient-Diffusion//ckpt/cayley_rotation `
+    --quantized  --rotation cayley `
+    --dataset_name coco2017val `
+    --dataset_path G://datasets//coco2017val `
+    --save_root G://Outputs//Efficient-Diffusion//eval_gen/sana-coco2017val-cayley
+```
+
+## FID
+Generate real images' FID stats as baseline.
+```bash
+# coco2017 FID stats
+python -m eval.main --fid --dataset_name coco2017 `
+    --precompute_fid_stats `
+    --fid_ref_stats G://datasets/coco2017_fid_stats.npz
+
+# 计算生成图 FID
+```
+
+Calculate generated images' FID stats.
+```bash
+python -m eval.main --fid `
+    --input_dir G://Outputs//Efficient-Diffusion//eval_gen/sana-coco2017val-hadamard-identity `
+    --output_dir G://Outputs//Efficient-Diffusion//eval_gen/sana-coco2017val-hadamard-identity `  
+    --dataset_name coco2017 `
+    --fid_ref_stats G://datasets/coco2017_fid_stats.npz
+```

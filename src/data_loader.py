@@ -23,6 +23,7 @@ import torch
 
 from src.data.mnist import get_mnist_dataloader
 from src.data.cifar import get_cifar100_dataloader
+from src.data.coco2017 import get_coco2017_dataloader
 
 from src.data.t2i import (  # noqa: F401 – re-export everything
     LatentDataset,
@@ -57,6 +58,10 @@ def get_dataloader(
     Args:
         dataset_name:
             | ``"mnist"`` — MNIST (grayscale, no VAE/tokenizer needed).
+            | ``"cifar100"`` — CIFAR-100 (RGB, prompt from class labels).
+            | ``"coco2017"`` — COCO 2017 **validation** split only, via ModelScope.
+              Uses instance-segmentation categories to generate prompts
+              (same template strategy as CIFAR-100).
             | ``"pokemon"`` | ``"coco"`` | ``"flickr30k"`` | ``"cc12m"`` —
               T2I datasets requiring VAE and tokenizer.
         dataset_config:
@@ -76,8 +81,18 @@ def get_dataloader(
             - ``drop_last`` (bool): drop incomplete last batch (default ``True``).
             - ``max_token_length`` (int): tokenizer max length (default ``77``).
 
-            **MNIST only**
+            **MNIST / CIFAR-100 only**
             - ``data_dir`` (str): download / storage directory (default ``"./data"``).
+
+            **COCO2017 only**
+            - ``data_dir`` (str): local root with ``val2017/`` +
+              ``annotations/instances_val2017.json``.  If ``None`` or invalid,
+              downloads from ModelScope (PAI/COCO2017 validation split).
+            - ``cache_dir`` (str): ModelScope download cache override.
+            - ``image_size`` (int): resize target (default ``512``).
+            - ``max_samples`` (int): cap on images loaded from the annotation
+              JSON (-1 = all 5000 val images).
+            - ``max_token_length`` (int): tokenizer max length (default ``77``).
 
         vae:
             Frozen VAE (AutoencoderKL) for image→latent encoding.  Required
@@ -92,6 +107,13 @@ def get_dataloader(
         **MNIST**: Each batch is ``(image, label)`` — ``image`` shape ``(B, 1, 28, 28)``
         normalised to [-1, 1].
 
+        **CIFAR-100 / COCO2017 (raw mode)**: Each batch is
+        ``(image, category_idx, prompt)`` — ``image`` shape ``(B, 3, H, W)``
+        normalised to [-1, 1].
+
+        **COCO2017 (latent mode, when vae+tokenizer+text_encoder given)**:
+        Each batch is ``(latent, encoder_hidden_states)``.
+
         **T2I**: Each batch is ``(latent, tokens_dict)`` —
         ``latent`` shape ``(B, C, H, W)``,
         ``tokens_dict`` = ``{"input_ids": (B, seq_len), "attention_mask": (B, seq_len)}``.
@@ -99,7 +121,6 @@ def get_dataloader(
 
     dataset_name_lower = dataset_name.lower()
 
-    # ── MNIST ──────────────────────────────────────────────────────────
     if dataset_name == "mnist":
         mnist_cfg = {
             "batch_size": dataset_config.get("batch_size", 128),
@@ -122,7 +143,34 @@ def get_dataloader(
         val_loader = get_cifar100_dataloader(**cifar100_cfg, train=False)
         return train_loader, val_loader
 
-    # ── T2I ────────────────────────────────────────────────────────────
+    # ── COCO 2017 (validation split only, ModelScope) ─────────────────
+    elif dataset_name_lower in ("coco2017", "coco_2017"):
+        coco_cfg = {
+            "batch_size": dataset_config.get("batch_size", 32),
+            "data_dir": dataset_config.get("data_dir", None),
+            "cache_dir": dataset_config.get("cache_dir", None),
+            "image_size": dataset_config.get("image_size", 512),
+            "max_samples": dataset_config.get("max_samples", -1),
+            "num_workers": dataset_config.get("num_workers", 0),
+            "pin_memory": dataset_config.get("pin_memory", False),
+            "max_token_length": dataset_config.get("max_token_length", 77),
+        }
+        # Latent mode only when all three are provided (matches cifar/mqjh)
+        if vae is not None and tokenizer is not None and dataset_config.get("text_encoder") is not None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            dtype = _resolve_dtype(dataset_config.get("dtype", None), vae)
+            coco_cfg.update({
+                "vae": vae,
+                "tokenizer": tokenizer,
+                "text_encoder": dataset_config["text_encoder"],
+                "device": device,
+                "dtype": dtype,
+            })
+        train_loader = get_coco2017_dataloader(**coco_cfg, train=True)
+        val_loader = get_coco2017_dataloader(**coco_cfg, train=False)
+        return train_loader, val_loader
+
+    
     elif dataset_name_lower in _T2I_DATASETS:
         if vae is None or tokenizer is None:
             raise ValueError(
@@ -154,13 +202,41 @@ def get_dataloader(
 
     raise ValueError(
         f"Unknown dataset '{dataset_name}'. "
-        f"Supported: mnist, {', '.join(sorted(_T2I_DATASETS))}"
+        f"Supported: mnist, cifar100, coco2017, {', '.join(sorted(_T2I_DATASETS))}"
     )
 
 
 # ---------------------------------------------------------------------------
 # Prompt-based calibration dataloader
 # ---------------------------------------------------------------------------
+
+def get_dataset_prompts(
+    dataset_name: str,
+    dataset_path: str,
+    n_sample: int = -1,
+) -> list:
+    """Return a list of text prompts from a T2I dataset.
+
+    Uses ``_build_paths_and_captions`` to locate images + captions, then
+    returns only the caption strings.  When ``n_sample`` is -1, all available
+    prompts are returned.
+
+    Args:
+        dataset_name: e.g. ``"mjhq-30k"``, ``"coco"``, ``"pokemon"`` …
+        dataset_path: Local path to the dataset directory.
+        n_sample: Maximum number of prompts to return (-1 = all).
+
+    Returns:
+        List[str]: Prompts from the dataset.
+    """
+    # Normalise: "MJHQ-30K" -> "mjhq30k" to match _build_paths_and_captions
+    dataset_key = dataset_name.lower().replace("-", "").replace("_", "")
+    max_total = n_sample if n_sample > 0 else 10 ** 9
+    _, captions, _ = _build_paths_and_captions(
+        dataset_key, max_total=max_total, dataset_path=dataset_path,
+    )
+    return captions
+
 
 def get_dataloader_prompt(
     dataset_name: str,

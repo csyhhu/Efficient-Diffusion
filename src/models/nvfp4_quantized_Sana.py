@@ -46,6 +46,7 @@ Usage::
 
 import math
 import os
+import gc
 import json
 from typing import Optional, List, Any
 from types import SimpleNamespace
@@ -67,20 +68,21 @@ def _get_timestep_embedding(
     scale: float = 1,
     max_period: int = 10000,
 ) -> torch.Tensor:
-    """Sinusoidal timestep embeddings that preserve input dtype.
-    
-    Same as diffusers' get_timestep_embedding but without the .float() conversion.
+    """Sinusoidal timestep embeddings — matches diffusers' get_timestep_embedding.
+
+    Computes in float32 (like diffusers) to avoid bfloat16 precision loss
+    in the sinusoidal computation, then casts back to the input dtype.
     """
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
     exponent = -math.log(max_period) * torch.arange(
-        start=0, end=half_dim, dtype=timesteps.dtype, device=timesteps.device
+        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
     )
     exponent = exponent / (half_dim - downscale_freq_shift)
 
     emb = torch.exp(exponent)
-    emb = timesteps[:, None] * emb[None, :]
+    emb = timesteps[:, None].float() * emb[None, :]
 
     emb = scale * emb
 
@@ -92,7 +94,7 @@ def _get_timestep_embedding(
     if embedding_dim % 2 == 1:
         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
 
-    return emb
+    return emb.to(timesteps.dtype)
 
 
 class _Timesteps(nn.Module):
@@ -949,8 +951,14 @@ class NVFP4QuantizedSana(nn.Module):
                         use_nvfp4: bool = True,
                         rotation=None,
                         permutation=None,
+                        ref_model=None,
                         **kwargs):
-        """Build NVFP4QuantizedSana / unquantized Sana from a pretrained checkpoint."""
+        """Build NVFP4QuantizedSana / unquantized Sana from a pretrained checkpoint.
+
+        Args:
+            ref_model: Optional pre-loaded SanaTransformer2DModel to copy weights
+                       from. If None, loads the reference model from disk.
+        """
         from diffusers import SanaTransformer2DModel
 
         download_source = (download_source
@@ -1006,12 +1014,24 @@ class NVFP4QuantizedSana(nn.Module):
         )
 
         # Step 4: load reference model & copy weights
-        ref = SanaTransformer2DModel.from_pretrained(
-            local_path, subfolder=subfolder, local_files_only=True, 
-            torch_dtype=torch_dtype,
-        )
+        # Convert to target dtype BEFORE loading reference to halve peak memory.
+        model = model.to(dtype=torch_dtype)
+
+        _should_del_ref = ref_model is None
+        if ref_model is None:
+            ref = SanaTransformer2DModel.from_pretrained(
+                local_path, subfolder=subfolder, local_files_only=True,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+            )
+        else:
+            ref = ref_model
+
         model._copy_weights(ref)
-        del ref
+
+        if _should_del_ref:
+            del ref
+            gc.collect()
 
         return model
 

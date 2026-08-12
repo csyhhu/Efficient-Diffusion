@@ -91,6 +91,11 @@ class NVFP4Linear(nn.Linear):
         self.x_quant = None
         self.W_quant = None
         self.output = None
+        # When True, forward() stores intermediates (x_eff, W_eff, ...) on
+        # self for debugging / quantization-error analysis.  When False (default),
+        # intermediates are local variables that are freed immediately, saving
+        # several GB of GPU memory during inference.
+        self.store_intermediates = False
 
     def _effective_weight(self):
         # rotation first, then permutation
@@ -111,34 +116,38 @@ class NVFP4Linear(nn.Linear):
         return x
 
     def forward(self, x, quantization_error_info=None):
-        self.x_eff = self._effective_activation(x)
-        self.W_eff = self._effective_weight()
+        x_eff = self._effective_activation(x)
+        W_eff = self._effective_weight()
         if self.quantize:
-            # quantize WEIGHT in the rotated+permuted basis
-            self.W_quant = NVFP4Quantization.apply(
-                self.W_eff, self.block_size,
+            W_quant = NVFP4Quantization.apply(
+                W_eff, self.block_size,
                 quantization_error_info,
                 f"{self.layer_prefix}.weight" if self.layer_prefix else "weight",
             )
-            # quantize ACTIVATION in the SAME transformed basis (R·P applied first,
-            # then FP4), so the block layout aligns with the weight's contraction
-            # dimension. NVFP4ActivationQuantization expects 3D [bs, n_seq, dim];
-            # for higher-rank activations we fuse all leading dims into (bs, n_seq)
-            # and restore the original shape afterwards (tokens are quantized
-            # independently along the last/feature dim, so ordering is irrelevant).
             act_prefix = f"{self.layer_prefix}.input" if self.layer_prefix else "input"
-            orig_shape = self.x_eff.shape
+            orig_shape = x_eff.shape
             xq3d = NVFP4ActivationQuantization.apply(
-                self.x_eff.reshape(orig_shape[0], -1, orig_shape[-1]),
+                x_eff.reshape(orig_shape[0], -1, orig_shape[-1]),
                 self.block_size,
                 quantization_error_info, act_prefix,
             )
-            self.x_quant = xq3d.reshape(orig_shape)
+            x_quant = xq3d.reshape(orig_shape)
         else:
-            self.W_quant = self.W_eff
-            self.x_quant = self.x_eff
-        self.output = F.linear(self.x_quant, self.W_quant, self.bias)
-        return self.output
+            W_quant = W_eff
+            x_quant = x_eff
+        output = F.linear(x_quant, W_quant, self.bias)
+
+        # Only store intermediates when explicitly requested (e.g. during
+        # calibration / quantization-error analysis).  During normal inference
+        # we skip this to avoid holding ~7 GB of stale activations across all
+        # NVFP4Linear layers in the model.
+        if self.store_intermediates:
+            self.x_eff = x_eff
+            self.W_eff = W_eff
+            self.x_quant = x_quant
+            self.W_quant = W_quant
+            self.output = output
+        return output
 
     def get_differentiable_quantization_error(self, loss_fn):
         return loss_fn(self.x_quant.detach(), self.x_eff), loss_fn(self.W_quant.detach(), self.W_eff)

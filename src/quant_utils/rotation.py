@@ -45,14 +45,28 @@ class RotationBase(nn.Module):
 
 
 class IdentityRotation(RotationBase):
-    """Identity rotation (baseline). R = I_n."""
+    """Identity rotation (baseline). R = I_n.
+
+    Optimised: does NOT store the n×n identity matrix, and rotate_weight /
+    rotate_activation return their inputs directly without a matrix multiply.
+    This saves ~8 GB of GPU memory for SD3.5-medium (288 Linear layers).
+    """
 
     def fit(self):
-        self.register_buffer('_rotation', torch.eye(self.in_features))
-    
+        pass  # No buffer needed — identity is a no-op.
+
     @property
     def rotation(self):
-        return self._rotation
+        # Lazily create the matrix only if someone explicitly requests it
+        # (e.g. for serialisation).  Not stored as a buffer to avoid the
+        # GPU memory overhead.
+        return torch.eye(self.in_features)
+
+    def rotate_weight(self, W):
+        return W  # W @ I = W
+
+    def rotate_activation(self, x):
+        return x  # x @ I = x
 
 
 class HadamardRotation(RotationBase):

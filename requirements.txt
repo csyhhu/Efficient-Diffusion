@@ -29,3 +29,5 @@ omegaconf>=2.3.0
 
 # 
 modelscope
+
+addict # For coco2017 download

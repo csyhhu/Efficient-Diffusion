@@ -37,6 +37,7 @@ if __name__ == "__main__":
             layer_prefix="base"
         )
         linear_cayley.load_state_dict(linear_ori.state_dict(), strict=False)
+        linear_cayley.store_intermediates = True  # needed for get_differentiable_quantization_error
         optimizer = torch.optim.Adam([linear_cayley.rotation.K], lr=1e-3)
         
         loss_act_history = []

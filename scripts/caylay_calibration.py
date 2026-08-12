@@ -27,6 +27,7 @@ if __name__ == "__main__":
     parser.add_argument("--block_size", type=int, default=16)
     parser.add_argument("--output_dir", type=str, default="G://Outputs//Efficient-Diffusion//MJHQ-Sana")
     # parser.add_argument("--output_dir", type=str, default="G://Outputs//Efficient-Diffusion//cifar100_dit_fm")
+    parser.add_argument("--cayley_method", type=str, default="module-wise")
     parser.add_argument("--cayley_batches", type=int, default=8)
     parser.add_argument("--cayley_iters", type=int, default=20)
     parser.add_argument("--cayley_lr", type=float, default=0.01)
@@ -34,45 +35,28 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # """
     # Existing model
     gen = ImageGeneration(
         model_id=args.model_id,
         cache_dir=args.cache_dir,
         device=device,
         dtype=torch.bfloat16,
-        # dtype=torch.float32,
         use_nvfp4=True, block_size=args.block_size, 
         rotation="cayley", permutation="identity"
-        # rotation=None, permutation=None
     )
-    # """
-    # """
-    # gen.build_transformer(rotation="hadamard", permutation="identity", use_nvfp4=True)
-    # generated_tensor = gen.generate(args.prompt, num_steps=2, num_samples=4, seed=args.seed)
-    # save_sample_grid(generated_tensor, f"{args.output_dir}/generation/identity-identity-unquantized-image.jpg", 2)
-    # save_sample_grid(generated_tensor, f"{args.output_dir}/generation/none-none-unquantized-image.jpg", 2)
-    # save_sample_grid(generated_tensor, f"{args.output_dir}/generation/origin-model-num-step-2.jpg", 2)
-    # generated_images = gen.generate(args.prompt, num_samples=4, seed=args.seed, used_origin_pipe=True)
-    # save_pil_grid(generated_images, f"{args.output_dir}/generation/origin-pipe.jpg", 2)
-    # """
-    # """
-    # """
     error_info = gen.calibrate_cayley(
         calibrate_dataset_name=args.calib_dataset_name,
         # iters=args.cayley_iters,
         # lr=args.cayley_lr,
         iters=1,
         lr=0,
-        criterion="module-wise",
+        criterion=args.cayley_method,
         save_path=args.output_dir,
         test_mode=True
     )
     gen.plot_cayley_loss(error_info, save_root=args.output_dir)
-    # """
-    # """
-    # generated_tensor = gen.generate(args.prompt, num_samples=4, seed=args.seed)
-    # save_sample_grid(generated_tensor, f"{args.output_dir}/generation/step-wise-cayley-identity-quantized-image.jpg", 2)
+    gen.save_rotation(os.path.join(args.output_dir, "rotation_ckpt.pt"))
+    gen.generate(args.prompt, num_samples=4, visual_n_row=2, save_root=args.output_dir, save_name="cayley-test", seed=args.seed)
     # ---
     # Local Mode
     # ---

@@ -33,11 +33,20 @@ class PermutationBase:
 
 
 class IdentityPermutation(PermutationBase):
-    """No-op permutation (baseline)."""
+    """No-op permutation (baseline).
+
+    Optimised: does NOT store an arange tensor, and transform_weight /
+    transform_activation return their inputs directly without index_select.
+    """
 
     def fit(self, input_):
-        in_features = input_.shape[-1]
-        self.permutation = torch.arange(in_features, device=input_.device, dtype=torch.int64)
+        pass  # No permutation needed — identity is a no-op.
+
+    def transform_weight(self, W):
+        return W  # W[:, arange] = W
+
+    def transform_activation(self, x):
+        return x  # x[:, arange] = x
 
 
 class RandomPermutation(PermutationBase):
