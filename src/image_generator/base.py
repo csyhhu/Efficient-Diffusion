@@ -11,7 +11,8 @@ Provides common functionality shared by Sana and SD3 image generators:
 """
 
 import os
-import json
+import gc
+import json, yaml
 import time
 import copy
 import contextlib
@@ -37,7 +38,61 @@ from src.utils import save_sample_grid, EMAModel
 from src.schedulers import DDPMScheduler, FlowMatchingScheduler, ConsistencyModelScheduler
 from src.data.cifar import get_cifar100_dataloader, generate_prompt, CIFAR100_CLASSES
 from src.data.mqjh import get_mqjh30k_dataloader
-from src.data_loader import get_dataset_prompts
+from src.data_loader import get_dataset_prompts, get_dataloader
+
+from src.utils import memory_check
+
+
+def _plot_per_module_split(x_axis, per_module_data, all_names, save_dir,
+                           prefix, ylabel, title, modules_per_fig=10):
+    """Plot per-module loss trajectories, split into multiple PNGs.
+
+    Each PNG shows at most ``modules_per_fig`` (default 10) modules.
+    Files are named ``{prefix}_0.png``, ``{prefix}_1.png``, ...
+
+    Args:
+        x_axis: 1D numpy array of iteration indices.
+        per_module_data: dict {module_name: [val_per_iter, ...]}.
+        all_names: ordered list of module names to plot.
+        save_dir: Directory to save PNGs.  If None, nothing is saved.
+        prefix: Filename prefix (e.g. "module_wise").
+        ylabel: Y-axis label.
+        title: Plot title.
+        modules_per_fig: Max modules per figure (default 10).
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    if not all_names:
+        print(f"  No modules to plot for {prefix}")
+        return
+
+    n_figs = (len(all_names) + modules_per_fig - 1) // modules_per_fig
+    for fig_idx in range(n_figs):
+        start = fig_idx * modules_per_fig
+        end = min(start + modules_per_fig, len(all_names))
+        chunk = all_names[start:end]
+
+        fig, ax = plt.subplots(1, 1, figsize=(12, 7))
+        for mname in chunk:
+            series = per_module_data.get(mname, [0.0] * len(x_axis))
+            # Shorten module name for legend readability.
+            parts = mname.split(".")
+            short = ".".join(parts[-2:]) if len(parts) >= 2 else mname
+            ax.plot(x_axis, series, linewidth=1.0, alpha=0.8, label=short)
+        ax.set_xlabel("Calibration iteration")
+        ax.set_ylabel(ylabel)
+        ax.set_yscale("log")
+        ax.set_title(f"{title} [{start}:{end}]")
+        ax.grid(True, alpha=0.3, which="both")
+        ax.legend(loc="best", fontsize=7)
+        plt.tight_layout()
+        if save_dir is not None:
+            p = os.path.join(save_dir, f"{prefix}_{fig_idx}.png")
+            plt.savefig(p, dpi=150, bbox_inches="tight")
+            print(f"  {prefix} plot {fig_idx} (modules {start}:{end}) saved to: {p}")
+        plt.close(fig)
 
 
 class BaseImageGenerator:
@@ -54,18 +109,6 @@ class BaseImageGenerator:
       - ``_custom_generate``: model-specific generation logic
       - ``compute_distillation_loss``: model-specific distillation loss
     """
-
-    # Sana CHI prompt prefix (same as SanaSprintPipeline.__call__ default)
-    _SANA_CHI = [
-        "Given a user prompt, generate an 'Enhanced prompt' that provides detailed visual descriptions suitable for image generation. Evaluate the level of detail in the user prompt:",
-        "- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, and spatial relationships to create vivid and concrete scenes.",
-        "- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating.",
-        "Here are examples of how to transform or refine prompts:",
-        "- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat curled up in a round shape, sleeping peacefully on a warm sunny windowsill, surrounded by pots of blooming red flowers.",
-        "- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street lamps, a diverse crowd of people in colorful clothing, and a double-decker bus passing by towering glass skyscrapers.",
-        "Please generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:",
-        "User Prompt: ",
-    ]
 
     def __init__(
         self,
@@ -203,25 +246,99 @@ class BaseImageGenerator:
         """Build the local DiT pipeline: scheduler, transformer, configs."""
         # Load local configs
         config_dir = self.local_config_path or os.path.dirname(self.model_id) if self.model_id else "."
-        model_config_path = os.path.join(config_dir, "model_config.json")
-        dataset_config_path = os.path.join(config_dir, "dataset_config.json")
-        running_config_path = os.path.join(config_dir, "running_config.json")
+        model_config_path = os.path.join(config_dir, "model.yaml")
+        dataset_config_path = os.path.join(config_dir, "dataset.yaml")
+        running_config_path = os.path.join(config_dir, "running.yaml")
 
         with open(model_config_path, "r", encoding="utf-8") as f:
-            self._local_model_config = json.load(f)
+            self._local_model_config = yaml.safe_load(f)
         with open(dataset_config_path, "r", encoding="utf-8") as f:
-            self._local_dataset_config = json.load(f)
+            self._local_dataset_config = yaml.safe_load(f)
         with open(running_config_path, "r", encoding="utf-8") as f:
-            self._local_running_config = json.load(f)
+            self._local_running_config = yaml.safe_load(f)
 
         self.build_local_scheduler()
         self.transformer = self.build_local_transformer()
 
-        # Build a simple VAE + tokenizer for local mode
-        self.vae = None
-        self.tokenizer = None
-        self.text_encoder = None
+        # Load VAE, tokenizer, text_encoder for local mode (needed for
+        # latent-space datasets like CIFAR-100 latent). Reuses logic from
+        # ImageGeneration.build_local_pipeline: resolve local model path,
+        # load AutoencoderKL + BertTokenizer + BertModel.
+        cache_dir = self._local_model_config.get("cache_dir", self.cache_dir)
+        vae_repo = self._local_model_config.get("vae", "stabilityai/sd-vae-ft-mse")
+        text_encoder_repo = self._local_model_config.get("text_encoder", "iic/multi-modal_clip-vit-base-patch16_zh")
+
+        vae_path = self._find_or_download_component(
+            vae_repo, cache_dir,
+            ["config.json", "diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"],
+        )
+        te_path = self._find_or_download_component(
+            text_encoder_repo, cache_dir,
+            ["config.json", "pytorch_model.bin", "vocab.txt"],
+        )
+
+        print(f">> [local] Loading VAE from: {vae_path}")
+        from diffusers import AutoencoderKL
+        self.vae = AutoencoderKL.from_pretrained(
+            vae_path, torch_dtype=self.dtype
+        ).to(self.device).eval()
+        for p in self.vae.parameters():
+            p.requires_grad = False
+
+        print(f">> [local] Loading tokenizer from: {te_path}")
+        from transformers import BertTokenizer, BertModel, BertConfig
+        self.tokenizer = BertTokenizer.from_pretrained(te_path)
+
+        print(f">> [local] Loading text encoder from: {te_path}")
+        config = BertConfig.from_dict({
+            "vocab_size": 21128,
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "hidden_act": "gelu",
+            "hidden_dropout_prob": 0.1,
+            "attention_probs_dropout_prob": 0.1,
+            "max_position_embeddings": 512,
+            "type_vocab_size": 2,
+            "initializer_range": 0.02,
+        })
+        self.text_encoder = BertModel(config)
+        state_dict = torch.load(
+            os.path.join(te_path, "pytorch_model.bin"), map_location="cpu"
+        )
+        state_dict = state_dict.get("state_dict", state_dict)
+        bert_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("module.bert."):
+                bert_state_dict[key.replace("module.bert.", "")] = value
+        self.text_encoder.load_state_dict(bert_state_dict, strict=False)
+        self.text_encoder = self.text_encoder.to(self.dtype).to(self.device).eval()
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
+
         self._max_token_length = self._local_model_config.get("max_token_length", 77)
+
+    def _find_or_download_component(self, repo_id, cache_dir, required_files):
+        """Find existing component or download it from ModelScope."""
+        paths_to_check = [
+            os.path.join(cache_dir, repo_id),
+            os.path.join(cache_dir, repo_id.replace("/", "_")),
+            os.path.join(cache_dir, "._____temp", repo_id),
+        ]
+        for path in paths_to_check:
+            if os.path.exists(path):
+                existing_files = [f for f in required_files if os.path.exists(os.path.join(path, f))]
+                if len(existing_files) >= len(required_files) // 2:
+                    print(f">> [local] Found component at: {path}")
+                    return path
+        print(f">> [local] Downloading {repo_id} from ModelScope...")
+        from modelscope import snapshot_download
+        local_path = snapshot_download(
+            repo_id, cache_dir=cache_dir, allow_patterns=required_files,
+        )
+        print(f">> [local] Downloaded to: {local_path}")
+        return local_path
 
     def build_local_scheduler(self):
         """Build scheduler based on running config."""
@@ -239,8 +356,8 @@ class BaseImageGenerator:
     def build_local_transformer(self, is_ref=False):
         """Build the local transformer model from config."""
         cfg = self._local_model_config
-        rotation = cfg.get("rotation", self.rotation)
-        permutation = cfg.get("permutation", self.permutation)
+        rotation = self.rotation if self.rotation else cfg.get("rotation", None)
+        permutation = self.permutation if self.permutation else cfg.get("permutation", None)
 
         if is_ref:
             transformer = NVFP4DiT(
@@ -272,83 +389,6 @@ class BaseImageGenerator:
             )
 
         return transformer.to(self.device, dtype=self.dtype)
-
-    # ==================================================================
-    # Local mode: dataset / training
-    # ==================================================================
-
-    def get_dataloader(self, dataset_name=None):
-        """Create train and validation data loaders."""
-        dataset_config = self._local_dataset_config if self._local_dataset_config else {}
-        if dataset_name is None:
-            dataset_name = dataset_config.get("dataset_name", "cifar100")
-
-        if dataset_name == "cifar100":
-            self.train_loader = get_cifar100_dataloader(
-                train=True,
-                root=dataset_config.get("data_dir", "./data"),
-                batch_size=dataset_config.get("batch_size", 128),
-                image_size=dataset_config.get("image_size", 32),
-                vae=self.vae,
-                tokenizer=self.tokenizer,
-                text_encoder=self.text_encoder,
-                device=self.device,
-                dtype=self.dtype,
-                max_token_length=dataset_config.get("max_token_length", self._max_token_length),
-                num_workers=dataset_config.get("num_workers", 0),
-                pin_memory=dataset_config.get("pin_memory", False),
-                persistent_workers=dataset_config.get("persistent_workers", False),
-            )
-            self.val_loader = get_cifar100_dataloader(
-                train=False,
-                root=dataset_config.get("data_dir", "./data"),
-                batch_size=dataset_config.get("batch_size", 128),
-                image_size=dataset_config.get("image_size", 32),
-                vae=self.vae,
-                tokenizer=self.tokenizer,
-                text_encoder=self.text_encoder,
-                device=self.device,
-                dtype=self.dtype,
-                max_token_length=dataset_config.get("max_token_length", self._max_token_length),
-                num_workers=dataset_config.get("num_workers", 0),
-                pin_memory=dataset_config.get("pin_memory", False),
-                persistent_workers=dataset_config.get("persistent_workers", False),
-            )
-        elif dataset_name == "MJHQ-30K":
-            self.train_loader = get_mqjh30k_dataloader(
-                train=True,
-                root=dataset_config.get("data_dir", "G://datasets//MJHQ-30K"),
-                batch_size=dataset_config.get("batch_size", 1),
-                image_size=dataset_config.get("image_size", 512),
-                vae=self.vae,
-                tokenizer=self.tokenizer,
-                text_encoder=self.text_encoder,
-                device=self.device,
-                dtype=self.dtype,
-                max_token_length=dataset_config.get("max_token_length", self._max_token_length),
-                num_workers=dataset_config.get("num_workers", 0),
-                pin_memory=dataset_config.get("pin_memory", False),
-                persistent_workers=dataset_config.get("persistent_workers", False),
-            )
-            self.val_loader = get_mqjh30k_dataloader(
-                train=False,
-                root=dataset_config.get("data_dir", "G://datasets//MJHQ-30K"),
-                batch_size=dataset_config.get("batch_size", 1),
-                image_size=dataset_config.get("image_size", 512),
-                vae=self.vae,
-                tokenizer=self.tokenizer,
-                text_encoder=self.text_encoder,
-                device=self.device,
-                dtype=self.dtype,
-                max_token_length=dataset_config.get("max_token_length", self._max_token_length),
-                num_workers=dataset_config.get("num_workers", 0),
-                pin_memory=dataset_config.get("pin_memory", False),
-                persistent_workers=dataset_config.get("persistent_workers", False),
-            )
-        else:
-            raise ValueError(f"Dataset {dataset_name} not supported.")
-
-        return self.train_loader, self.val_loader
 
     def prepare_local_training(self):
         """Prepare data loaders and optimizer for local training."""
@@ -526,59 +566,36 @@ class BaseImageGenerator:
         print(f"Checkpoint loaded (epoch={checkpoint.get('epoch', '?')}, loss={checkpoint.get('loss', '?')})")
 
     # ==================================================================
-    # Prompt encoding
+    # Prompt encoding (generic local-DiT path)
+    # Subclasses (SanaImageGenerator / SD3ImageGenerator) override this
+    # with model-specific encoding logic.
     # ==================================================================
 
     def encode_prompt(self, prompt, max_sequence_length=300, num_images_per_prompt=1,
                       do_classifier_free_guidance=True, negative_prompt=None):
-        """Encode prompt, dispatching to model-specific encoder.
+        """Encode prompt text into embeddings for local DiT mode (BERT).
+
+        Generic single-tokenizer path used by ``dit_cifar100_fm`` etc.
+        Subclasses override this for Sana (Gemma+CHI) and SD3 (dual-CLIP).
 
         Returns:
-            (prompt_embeds, prompt_attention_mask, pooled_prompt_embeds)
-            For Sana: pooled_prompt_embeds is None.
-            For SD3: prompt_attention_mask is None.
-        """
-        if self.model_id == "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers":
-            prompt_embeds, prompt_attention_mask = self._encode_prompt_sana(
-                prompt, num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-            )
-            return prompt_embeds, prompt_attention_mask, None
-        elif self.model_id == "stabilityai/stable-diffusion-3.5-medium":
-            prompt_embeds, prompt_attention_mask, pooled_prompt_embeds = \
-                self._encode_prompt_sd3(
-                    prompt,
-                    num_images_per_prompt=num_images_per_prompt,
-                    max_sequence_length=max_sequence_length,
-                    do_classifier_free_guidance=do_classifier_free_guidance,
-                    negative_prompt=negative_prompt,
-                )
-            return prompt_embeds, prompt_attention_mask, pooled_prompt_embeds
-        else:
-            raise ValueError(f"Unknown model_id: {self.model_id}")
-
-    def _encode_prompt_sana(self, prompt, num_images_per_prompt=1,
-                            max_sequence_length=300):
-        """Sana prompt encoding: Gemma + CHI prefix.
-
-        Mirrors ``SanaSprintPipeline._get_gemma_prompt_embeds`` exactly.
+            (prompt_embeds, prompt_attention_mask, pooled_prompt_embeds=None)
         """
         if getattr(self, "tokenizer", None) is not None:
             self.tokenizer.padding_side = "right"
 
+        max_length = getattr(self, "_max_token_length", max_sequence_length)
+        select_index = [0] + list(range(-max_length + 1, 0))
+
         if isinstance(prompt, str):
             prompt = [prompt]
-        prompt = [p.strip() for p in prompt]
 
-        chi_prompt = "\n".join(self._SANA_CHI)
-        prompt = [chi_prompt + p for p in prompt]
-        num_chi_prompt_tokens = len(self.tokenizer.encode(chi_prompt))
-        max_length_all = num_chi_prompt_tokens + max_sequence_length - 2
+        prompt = [p.lower().strip() for p in prompt]
 
         text_inputs = self.tokenizer(
             prompt,
             padding="max_length",
-            max_length=max_length_all,
+            max_length=max_length,
             truncation=True,
             add_special_tokens=True,
             return_tensors="pt",
@@ -591,9 +608,6 @@ class BaseImageGenerator:
             attention_mask=prompt_attention_mask,
         )
         prompt_embeds = text_enc_out[0].to(dtype=self.dtype, device=self.device)
-
-        max_length = max_sequence_length
-        select_index = [0] + list(range(-max_length + 1, 0))
         prompt_embeds = prompt_embeds[:, select_index]
         prompt_attention_mask = prompt_attention_mask[:, select_index]
 
@@ -603,83 +617,7 @@ class BaseImageGenerator:
         prompt_attention_mask = prompt_attention_mask.view(bs_embed, -1)
         prompt_attention_mask = prompt_attention_mask.repeat(num_images_per_prompt, 1)
 
-        return prompt_embeds, prompt_attention_mask
-
-    def _encode_prompt_sd3(self, prompt, num_images_per_prompt=1,
-                           max_sequence_length=256,
-                           do_classifier_free_guidance=True,
-                           negative_prompt=None):
-        """SD3 prompt encoding: CLIP-L + CLIP-G concat, then T5 zero-padding.
-
-        Mirrors ``StableDiffusion3Pipeline.encode_prompt`` without T5.
-        """
-        tokenizers = self.tokenizer
-        text_encoders = self.text_encoder
-
-        if isinstance(prompt, str):
-            prompt = [prompt]
-        prompt = [p.strip() for p in prompt]
-
-        if negative_prompt is None:
-            negative_prompt = [""] * len(prompt)
-        elif isinstance(negative_prompt, str):
-            negative_prompt = [negative_prompt]
-        negative_prompt = [p.strip() for p in negative_prompt]
-
-        clip_max_length = max(
-            t.model_max_length for t in tokenizers if hasattr(t, "model_max_length")
-        ) if isinstance(tokenizers, (list, tuple)) else tokenizers.model_max_length
-
-        joint_dim = self._transformer_config.get("joint_attention_dim", 4096)
-
-        def _encode_one(prompt_list):
-            prompts_embeds_list = []
-            pooled_prompt_embeds_list = []
-            for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-                if hasattr(tokenizer, "padding_side"):
-                    tokenizer.padding_side = "right"
-                text_inputs = tokenizer(
-                    prompt_list,
-                    padding="max_length",
-                    max_length=clip_max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                input_ids = text_inputs.input_ids.to(self.device)
-                out = text_encoder(input_ids, output_hidden_states=True)
-                emb = out.hidden_states[-2].to(self.dtype)
-                pooled = out[0].to(self.dtype)
-                prompts_embeds_list.append(emb)
-                pooled_prompt_embeds_list.append(pooled)
-            prompt_embeds = torch.cat(prompts_embeds_list, dim=-1)
-            pooled_prompt_embeds = torch.cat(pooled_prompt_embeds_list, dim=-1)
-            pad = joint_dim - prompt_embeds.shape[-1]
-            if pad > 0:
-                prompt_embeds = torch.nn.functional.pad(prompt_embeds, (0, pad))
-            batch_size = prompt_embeds.shape[0]
-            t5_zeros = torch.zeros(
-                (batch_size, max_sequence_length, joint_dim),
-                device=self.device, dtype=self.dtype,
-            )
-            prompt_embeds = torch.cat([prompt_embeds, t5_zeros], dim=1)
-            return prompt_embeds, pooled_prompt_embeds
-
-        prompt_embeds, pooled_prompt_embeds = _encode_one(prompt)
-        if do_classifier_free_guidance:
-            neg_embeds, neg_pooled = _encode_one(negative_prompt)
-            prompt_embeds = torch.cat([neg_embeds, prompt_embeds], dim=0)
-            pooled_prompt_embeds = torch.cat([neg_pooled, pooled_prompt_embeds], dim=0)
-
-        def _repeat(t):
-            b, *rest = t.shape
-            t = t.unsqueeze(1).repeat(1, num_images_per_prompt, *([1] * len(rest)))
-            return t.view(b * num_images_per_prompt, *rest)
-
-        prompt_embeds = _repeat(prompt_embeds)
-        pooled_prompt_embeds = _repeat(pooled_prompt_embeds)
-        attention_mask = None
-
-        return prompt_embeds, attention_mask, pooled_prompt_embeds
+        return prompt_embeds, prompt_attention_mask, None
 
     # ==================================================================
     # Generation (common entry point)
@@ -795,6 +733,7 @@ class BaseImageGenerator:
             else:
                 image = result
             if save_root is not None and save_name is not None:
+                print(f"  Saved -> {os.path.join(save_root, save_name)}")
                 os.makedirs(save_root, exist_ok=True)
                 save_sample_grid(image, os.path.join(save_root, save_name), nrow=visual_n_row)
 
@@ -802,13 +741,160 @@ class BaseImageGenerator:
         return result
 
     def _custom_generate(self, *args, **kwargs):
-        """Subclass-specific custom generation logic. Override in subclasses."""
-        raise NotImplementedError("Subclasses must implement _custom_generate")
+        """Custom generation for local DiT models (DDPM / Flow-Matching).
+
+        Subclasses (SanaImageGenerator / SD3ImageGenerator) override with
+        pipeline-specific logic. The default implementation supports local
+        mode: sample initial noise, run ``num_steps`` scheduler iterations,
+        pass prompt embeddings to ``self.transformer``, then decode with
+        ``self.vae``.
+
+        Accepted kwargs (all forwarded from :meth:`generate`):
+
+        - prompt (str): Text prompt (used only if ``encoder_hidden_states`` is
+          not already cached by the caller). For local DiT models, the generic
+          :meth:`encode_prompt` single-tokenizer path is used.
+        - num_samples (int): Number of images to generate.
+        - seed (int | None): Random seed for initial noise sampling.
+        - num_steps (int | None): Number of denoising steps — defaults to
+          ``20`` for FM and ``50`` for DDPM.
+        - return_intermediates (bool): If ``True`` return
+          ``(pil_images, intermediates_dict)`` instead of just images.
+        - guidance_scale (float): Not used by local DiT (single prompt), but
+          accepted for API compatibility with Sana/SD3 subclasses.
+        """
+        # ---- Parse args (align with generate() signature for subclass parity) -
+        prompt = kwargs.get("prompt", None)
+        num_samples = int(kwargs.get("num_samples", 1))
+        seed = kwargs.get("seed", None)
+        num_steps = kwargs.get("num_steps", None)
+        return_intermediates = bool(kwargs.get("return_intermediates", False))
+
+        # ---- Scheduler selection ----------------------------------------------
+        is_fm = isinstance(self.scheduler, FlowMatchingScheduler)
+        is_ddpm = isinstance(self.scheduler, DDPMScheduler)
+        if not (is_fm or is_ddpm):
+            raise NotImplementedError(
+                f"BaseImageGenerator._custom_generate only supports "
+                f"FlowMatchingScheduler / DDPMScheduler, got {type(self.scheduler).__name__}. "
+                f"Override _custom_generate in the subclass."
+            )
+        if num_steps is None:
+            num_steps = 20 if is_fm else 50
+
+        # ---- Seed for reproducibility -----------------------------------------
+        if seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+        else:
+            generator = torch.Generator(device=self.device)
+
+        # ---- Latent / image shape ---------------------------------------------
+        # Local DiT operates in VAE latent space (image_size in config is the
+        # latent spatial size, e.g. 4 for CIFAR100 with 8× VAE downsample).
+        cfg = self._local_model_config or {}
+        latent_height = cfg.get("image_size", 4)
+        latent_width = cfg.get("image_size", 4)
+        latent_channels = cfg.get("in_channels", 4)
+        latent_shape = (num_samples, latent_channels, latent_height, latent_width)
+
+        # ---- Prompt encoding ---------------------------------------------------
+        # ``encode_prompt`` is overridden by SanaImageGenerator / SD3ImageGenerator
+        # but base version works for single-tokenizer local DiT (BERT / CIFAR).
+        prompt_embeds, prompt_attention_mask, _pooled = self.encode_prompt(
+            prompt or "a photo",
+            num_images_per_prompt=1,
+        )
+        # encode_prompt returns batch = len(prompt_list). Repeat or truncate to
+        # match num_samples so that batched transformer forward works.
+        if prompt_embeds.shape[0] != num_samples:
+            if prompt_embeds.shape[0] == 1:
+                prompt_embeds = prompt_embeds.repeat(num_samples, 1, 1)
+                if prompt_attention_mask is not None:
+                    prompt_attention_mask = prompt_attention_mask.repeat(num_samples, 1)
+            else:
+                prompt_embeds = prompt_embeds[:num_samples]
+                if prompt_attention_mask is not None:
+                    prompt_attention_mask = prompt_attention_mask[:num_samples]
+
+        # ---- Initialise latents (start from pure noise) -----------------------
+        with torch.no_grad():
+            if is_fm:
+                # Flow-Matching samples x ~ N(0,1) at t=1 (pure noise regime).
+                latents = torch.randn(latent_shape, generator=generator, device=self.device, dtype=self.dtype)
+            else:  # DDPM
+                # Same noise initialisation — scheduler step handles scale.
+                latents = torch.randn(latent_shape, generator=generator, device=self.device, dtype=self.dtype)
+
+        # ---- Build timestep sequence (mirrors compute_distillation_loss) ------
+        if is_ddpm:
+            self.scheduler.set_timesteps(num_steps, device=self.device)
+            boundary_timesteps = self.scheduler.timesteps.to(self.device)
+            timesteps = boundary_timesteps[:-1] if len(boundary_timesteps) == num_steps + 1 else boundary_timesteps
+        else:  # FM
+            boundary_timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=self.device)
+            timesteps = boundary_timesteps[:-1]
+
+        # ---- Optional intermediate recorder (for save_intermediates.py) -------
+        if return_intermediates:
+            intermediate_latents = []
+            intermediate_denoised = []
+            dit_outputs = []
+        else:
+            intermediate_latents = intermediate_denoised = dit_outputs = None
+
+        # ---- Denoising loop ----------------------------------------------------
+        self.transformer.eval()
+        with torch.no_grad():
+            for i in range(num_steps):
+                t = timesteps[i] if i < len(timesteps) else boundary_timesteps[-1]
+                t_batch = t.expand(num_samples).to(self.dtype)
+
+                # Local NVFP4DiT forward signature:
+                #   forward(x, t, encoder_hidden_states=None, quantization_error_info=None)
+                # Pass ``prompt_embeds`` as the 3rd positional arg, do not pass
+                # ``encoder_attention_mask`` because local DiT ignores it.
+                output = self.transformer(
+                    latents.to(self.dtype),
+                    t_batch,
+                    prompt_embeds.to(self.dtype),
+                )
+
+                if return_intermediates:
+                    dit_outputs.append(output.detach().cpu())
+                    intermediate_latents.append(latents.detach().cpu())
+
+                # Update latents via scheduler (mirrors compute_distillation_loss)
+                if is_fm:
+                    dt = (boundary_timesteps[i + 1] - boundary_timesteps[i]) if (i + 1) < len(boundary_timesteps) else -1.0 / num_steps
+                    latents = latents + output * dt
+                else:  # DDPM
+                    latents = self.scheduler.step(
+                        output, t_batch, latents, return_dict=False,
+                    )[0]
+
+                if return_intermediates:
+                    intermediate_denoised.append(latents.detach().cpu())
+
+        # ---- Decode latents → images ------------------------------------------
+        # ``_decode_latents_to_images`` returns clamped [-1, 1] CPU float32 tensor.
+        images = self._decode_latents_to_images(latents)
+
+        if return_intermediates:
+            intermediates = {
+                "dit_outputs": dit_outputs,
+                "latents": intermediate_latents,
+                "denoised": intermediate_denoised,
+                "num_steps": num_steps,
+                "scheduler_type": "fm" if is_fm else "ddpm",
+                "final_output": images.detach().cpu(),
+                "final_latents": latents.detach().cpu(),
+            }
+            return images, intermediates
+        return images
 
     # ==================================================================
     # Calibration utilities
     # ==================================================================
-
     def build_reference_model(self):
         """Build a reference model with the same weights but no quantization."""
         if self.local_mode:
@@ -844,70 +930,514 @@ class BaseImageGenerator:
         print(f"Loaded {loaded} rotation params from: {path}")
 
     def plot_cayley_loss(self, stats, save_root=None):
-        """Plot Cayley calibration loss history."""
+        """Plot figures from Cayley calibration ``error_info``.
+
+        Expects the raw structure produced by :meth:`calibrate_cayley`::
+
+            {
+              "iterations": {
+                iter_idx: {  # raw step_error_info from compute_distillation_loss
+                  step_idx: {
+                    "module_loss": {name: {"act": float, "param": float}},
+                    "layer_loss":  {name: float},
+                    "step_loss":   float,
+                    "dit_loss":    float,
+                  }, ...
+                  "dit_loss_sum": float,
+                }, ...
+              },
+              "opt_loss": {iter_idx: float, ...},
+              "final": float,
+              "criterion": str,
+              ...
+            }
+
+        This method does all aggregation from the raw per-step dicts.
+
+        Output structure under ``save_root/cayley_loss``::
+
+          cayley_criterion_sums.png
+            — Plot 1: x=iteration, y=sum of each criterion's aggregated loss
+              (module-wise Σ, layer-wise Σ, step-wise Σ, dit_loss Σ).
+
+          module_wise/   (folder)
+            — Plot 2 (split): per-module module-wise loss vs iteration.
+              One PNG per 10 modules, named ``module_wise_0.png``, ``module_wise_1.png``, ...
+
+          layer_wise/    (folder)
+            — Plot 3 (split): per-module layer-wise loss vs iteration.
+              One PNG per 10 modules, named ``layer_wise_0.png``, ``layer_wise_1.png``, ...
+        """
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        import numpy as np
 
-        if type(stats) != dict:
+        if not isinstance(stats, dict):
             print(f"Load error info from {stats}")
             stats = json.load(open(stats))
 
-        step_keys = [k for k in stats.keys() if isinstance(k, int)]
-        step_keys.sort()
-
-        if not step_keys:
-            print("Warning: No step data found in stats")
+        # ---- Normalise per-iteration records into a sorted list ---------------
+        iters_raw = stats.get("iterations", {})
+        if not iters_raw:
+            print("Warning: No 'iterations' key found in stats")
             return
 
-        fig, axes = plt.subplots(1, 1, figsize=(10, 6))
-        for step_idx in step_keys:
-            step_data = stats.get(step_idx, {})
-            step_loss = step_data.get('step_loss', 0)
-            axes.scatter(step_idx, step_loss, label=f'Step {step_idx}', s=50)
+        sorted_iters = sorted(
+            ((int(k), v) for k, v in iters_raw.items()),
+            key=lambda kv: kv[0],
+        )
+        iter_indices = [idx for idx, _ in sorted_iters]
+        x_axis = np.asarray(iter_indices, dtype=int)
+        n_iters = len(sorted_iters)
 
-        final_loss = stats.get('final', 0)
-        axes.axhline(y=final_loss, color='r', linestyle='--', label='Final Loss')
-        axes.set_xlabel('Step')
-        axes.set_ylabel('Loss')
-        axes.set_title('Step-wise Loss')
-        axes.legend()
-        axes.grid(True, alpha=0.3)
+        opt_loss_dict = stats.get("opt_loss", {})
+
+        save_dir = None
+        if save_root is not None:
+            save_dir = os.path.join(save_root, "cayley_loss")
+            os.makedirs(save_dir, exist_ok=True)
+
+        criterion_label = stats.get("criterion", "unknown")
+        fig_title_suffix = f" (criterion={criterion_label})"
+
+        # ---- Aggregate raw per-step dicts into per-iteration sums + per-module ----
+        # For each iteration, sum across all steps within that iteration.
+        mod_sum_list = []      # per-iteration: Σ all modules' (act+param)
+        layer_sum_list = []    # per-iteration: Σ all modules' layer_loss
+        step_sum_list = []     # per-iteration: Σ step_loss
+        dit_sum_list = []      # per-iteration: Σ dit_loss
+        opt_list = []           # per-iteration: opt_loss
+
+        # per-module trajectories: {module_name: [val_per_iter, ...]}
+        per_module_mod = {}    # act+param per module per iteration
+        per_module_layer = {}  # layer_loss per module per iteration
+
+        for _iter_idx, iter_data in sorted_iters:
+            mod_sum = 0.0
+            layer_sum = 0.0
+            step_sum = 0.0
+            dit_sum = 0.0
+            iter_mod = {}
+            iter_layer = {}
+
+            # iter_data is the raw step_error_info: {step_idx: {...}, "dit_loss_sum": float}
+            for s_key, s_rec in iter_data.items():
+                if s_key == "dit_loss_sum" or not isinstance(s_rec, dict):
+                    continue
+                # module_loss: {name: {"act": float, "param": float}}
+                for mname, mval in s_rec.get("module_loss", {}).items():
+                    combined = float(mval.get("act", 0.0)) + float(mval.get("param", 0.0))
+                    iter_mod[mname] = iter_mod.get(mname, 0.0) + combined
+                    mod_sum += combined
+                # layer_loss: {name: float}
+                for lname, lval in s_rec.get("layer_loss", {}).items():
+                    lv = float(lval)
+                    iter_layer[lname] = iter_layer.get(lname, 0.0) + lv
+                    layer_sum += lv
+                # step_loss
+                step_sum += float(s_rec.get("step_loss", 0.0))
+                # dit_loss
+                dit_sum += float(s_rec.get("dit_loss", 0.0))
+
+            mod_sum_list.append(mod_sum)
+            layer_sum_list.append(layer_sum)
+            step_sum_list.append(step_sum)
+            dit_sum_list.append(dit_sum)
+            opt_list.append(float(opt_loss_dict.get(str(_iter_idx), opt_loss_dict.get(_iter_idx, mod_sum))))
+
+            # Accumulate per-module trajectories
+            for mname, val in iter_mod.items():
+                if mname not in per_module_mod:
+                    per_module_mod[mname] = [0.0] * n_iters
+                per_module_mod[mname][_iter_idx] = val
+            for lname, val in iter_layer.items():
+                if lname not in per_module_layer:
+                    per_module_layer[lname] = [0.0] * n_iters
+                per_module_layer[lname][_iter_idx] = val
+
+        # ==================================================================
+        # Plot 1: criterion sums vs iteration
+        # ==================================================================
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        ax.plot(x_axis, mod_sum_list, marker='o', linewidth=2, label='module-wise (Σ act+param)')
+        ax.plot(x_axis, layer_sum_list, marker='s', linewidth=2, label='layer-wise (Σ per-module output diff)')
+        ax.plot(x_axis, step_sum_list, marker='^', linewidth=2, label='step-wise (Σ DiT output diff)')
+        ax.plot(x_axis, dit_sum_list, marker='D', linewidth=2, label='dit_loss (Σ diffusion training loss)')
+        ax.plot(x_axis, opt_list, marker='*', linewidth=2, linestyle='--', label='opt_loss')
+        ax.set_xlabel("Calibration iteration")
+        ax.set_ylabel("Aggregated loss (log scale)")
+        ax.set_yscale("log")
+        ax.set_title("Criterion-summed loss vs iteration" + fig_title_suffix)
+        ax.legend(loc="best", fontsize=9)
+        ax.grid(True, alpha=0.3, which="both")
         plt.tight_layout()
+        if save_dir is not None:
+            p = os.path.join(save_dir, "cayley_criterion_sums.png")
+            plt.savefig(p, dpi=150, bbox_inches="tight")
+            print(f"Plot 1 (criterion sums) saved to: {p}")
+        plt.close(fig)
 
-        save_path = f"{save_root}/cayley_loss"
+        # ==================================================================
+        # Plot 2: per-module module-wise loss (folder, 10 modules per image)
+        # ==================================================================
+        if save_dir is not None:
+            mod_dir = os.path.join(save_dir, "module_wise")
+            os.makedirs(mod_dir, exist_ok=True)
+        else:
+            mod_dir = None
+
+        all_mod_names = list(per_module_mod.keys())
+        _plot_per_module_split(
+            x_axis, per_module_mod, all_mod_names,
+            save_dir=mod_dir, prefix="module_wise",
+            ylabel="Module-wise loss (act+param, log scale)",
+            title="Per-module module-wise loss vs iteration" + fig_title_suffix,
+        )
+
+        # ==================================================================
+        # Plot 3: per-module layer-wise loss (folder, 10 modules per image)
+        # ==================================================================
+        if save_dir is not None:
+            layer_dir = os.path.join(save_dir, "layer_wise")
+            os.makedirs(layer_dir, exist_ok=True)
+        else:
+            layer_dir = None
+
+        all_layer_names = list(per_module_layer.keys())
+        _plot_per_module_split(
+            x_axis, per_module_layer, all_layer_names,
+            save_dir=layer_dir, prefix="layer_wise",
+            ylabel="Layer-wise loss (output diff, log scale)",
+            title="Per-module layer-wise loss vs iteration" + fig_title_suffix,
+        )
+
+    def _clear_intermediates(self, _models_to_clear: list = None):
+        """Clear stored intermediates in all NVFP4Linear modules.
+
+        After ``loss.backward()`` the computation graph is freed, but the
+        tensors stored as instance attributes (``x_eff``, ``W_eff``,
+        ``x_quant``, ``W_quant``, ``output``) still hold GPU memory.
+        Without clearing them, the next forward pass allocates new tensors
+        before the old ones are overwritten, causing an OOM spike.
+        """
+        # Clear intermediates on both the quantized transformer and the
+        # reference model (kept as ``self._calib_ref_model`` during calibration)
+        # so stale tensors from the previous iteration are released before the
+        # next forward pass allocates fresh ones.
+        for model_to_clear in _models_to_clear:
+            if model_to_clear is None:
+                continue
+            for _, module in model_to_clear.named_modules():
+                if hasattr(module, 'store_intermediates'):
+                    module.x_eff = None
+                    module.W_eff = None
+                    module.x_quant = None
+                    module.W_quant = None
+                    module.output = None
+
+    def _decode_latents_to_images(self, latents):
+        """Decode latents to images for test_mode visualisation.
+
+        During calibration the VAE is offloaded to CPU, so decoding happens
+        on CPU with no_grad. Subclasses override to apply model-specific
+        scaling (Sana: /sigma_data/scaling_factor, SD3: *scaling+shift).
+
+        Args:
+            latents: (B, C, H, W) latent tensor (on any device).
+
+        Returns:
+            (B, 3, H*8, W*8) image tensor in [-1, 1] on CPU.
+        """
+        with torch.no_grad():
+            vae_input = latents.detach().to(self.device, dtype=self.dtype)
+            scaling = getattr(self.vae.config, "scaling_factor", 1.0) or 1.0
+            vae_input = vae_input / scaling
+            images = self.vae.decode(vae_input, return_dict=False)[0]
+            return images.clamp(-1, 1).to(torch.float32)
+
+    def _offload_to_cpu(self):
+        """Offload text encoder(s) and VAE to CPU to free GPU memory.
+
+        During calibration the text encoder is not needed (embeddings are
+        pre-computed by the dataloader) and the VAE is only needed for
+        ``test_mode``. Moving them to CPU frees several GB of VRAM for
+        the Cayley rotation backward graph.
+        """
+        offloaded = []
+        if self.text_encoder is not None:
+            if isinstance(self.text_encoder, (list, tuple)):
+                for te in self.text_encoder:
+                    if hasattr(te, 'device') and te.device.type == 'cuda':
+                        te.to("cpu")
+                        offloaded.append(type(te).__name__)
+            elif hasattr(self.text_encoder, 'device') and self.text_encoder.device.type == 'cuda':
+                self.text_encoder.to("cpu")
+                offloaded.append(type(self.text_encoder).__name__)
+        if self.vae is not None and hasattr(self.vae, 'device') and self.vae.device.type == 'cuda':
+            self.vae.to("cpu")
+            offloaded.append("VAE")
+        if offloaded and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f">> [Sys Opt] Offloaded to CPU: {offloaded}")
+
+    def _restore_to_gpu(self):
+        """Restore text encoder(s) and VAE from CPU back to GPU.
+
+        Called after calibration to re-enable image generation.
+        """
+        restored = []
+        if self.text_encoder is not None:
+            if isinstance(self.text_encoder, (list, tuple)):
+                for te in self.text_encoder:
+                    if hasattr(te, 'device') and te.device.type == 'cpu':
+                        te.to(self.device, dtype=self.dtype)
+                        restored.append(type(te).__name__)
+            elif hasattr(self.text_encoder, 'device') and self.text_encoder.device.type == 'cpu':
+                self.text_encoder.to(self.device, dtype=self.dtype)
+                restored.append(type(self.text_encoder).__name__)
+        if self.vae is not None and hasattr(self.vae, 'device') and self.vae.device.type == 'cpu':
+            self.vae.to(self.device, dtype=self.dtype)
+            restored.append("VAE")
+        if restored:
+            print(f">> [Sys Opt] Restored to GPU: {restored}")
+
+    # ==================================================================
+    # Common: Cayley rotation calibration
+    # ==================================================================
+    def calibrate_cayley(
+        self,
+        calibrate_dataset_name=None, calib_dataset_path=None, calib_n_sample=None, calib_batch_size=None,
+        criterion="step-wise", iters=200, lr=0.01, 
+        num_steps=4, single_step_mode=False,
+        save_path=None, 
+        test_mode=False
+    ):
+        """Calibrate Cayley rotation by running a full decode loop (DiT + Scheduler update).
+
+        For each optimization iteration we:
+          1. Sample a calibration batch from the dataset (latents + text embeds).
+          2. Run a decode loop: for each step, call DiT on ``x_t``, then call
+             ``scheduler.step(...)`` to update the latents to ``x_{t-1}``.
+             **Noise is randomly sampled each iteration** (not fixed) to enable
+             proper diffusion training loss (``dit_loss``) computation — this
+             is equivalent to a normal training step with rotation applied.
+          3. Compute a distillation loss between quantized transformer and
+             unquantized ``ref_model`` based on ``criterion``:
+
+               - ``module-wise``: Σ per-NVFP4Linear activation and weight
+                 quantization errors (``get_differentiable_quantization_error``).
+               - ``layer-wise``: Σ per-NVFP4Linear output diff
+                 (``loss_fn(ref_module.output.detach(), module.output)``).
+               - ``step-wise``: error on the DiT final output
+                 (``loss_fn(output_target, output_ref)``).
+
+          4. Also compute ``dit_loss`` (standard diffusion training loss) —
+             recorded in error_info but NOT used for optimization (unless
+             criterion is set to "dit").
+          5. Back-prop through the chosen criterion and take one Adam step on
+             every Cayley ``K`` parameter.
+
+        The returned ``error_info`` stores the **raw per-step** dicts from
+        ``compute_distillation_loss`` (not aggregated).  Aggregation and
+        plotting is done in :meth:`plot_cayley_loss`.
+
+        Args:
+            calibrate_dataset_name: Dataset name (e.g. "MJHQ-30K", "coco2017val").
+            calib_dataset_path: Local path to the dataset.
+            calib_n_sample: Number of calibration samples.
+            calib_batch_size: Batch size for calibration.
+            criterion: Loss criterion for back-prop / optimizer update
+                (``'module-wise'`` | ``'layer-wise'`` | ``'step-wise'``).
+            iters: Number of Adam optimization iterations.
+            lr: Adam learning rate.
+            num_steps: Number of scheduler decode steps per iteration.
+            save_path: Directory to dump ``cayley_error_info.json``.
+            test_mode: If True, decode the final latents and save a sample grid.
+            single_step_mode: If True, sample one random decode-step per
+                iteration.  If False, run all ``num_steps`` per iteration.
+
+        Returns:
+            dict: ``error_info`` with the structure::
+
+                {
+                  "iterations": {
+                    iter_idx: {  # raw step_error_info from compute_distillation_loss
+                      step_idx: {
+                        "module_loss": {name: {"act": float, "param": float}},
+                        "layer_loss":  {name: float},
+                        "step_loss":   float,
+                        "dit_loss":    float,
+                      }, ...
+                      "dit_loss_sum": float,
+                    }, ...
+                  },
+                  "opt_loss": {iter_idx: float, ...},
+                  "final": float,
+                  "criterion": str,
+                  "iters": int,
+                  "num_steps": int,
+                }
+        """
+        cur_time = time.time()
+        # Build dataset_config for src.data_loader.get_dataloader.
+        # ``image_size`` controls the VAE-encoded latent resolution
+        # (image_size / 8). A smaller image_size reduces the token count and
+        # thus the GPU memory needed to store per-module intermediates for
+        # module/layer-wise loss across all 232 NVFP4Linear modules.
+        calib_batch_size = calib_batch_size if calib_batch_size is not None else calib_n_sample
+        dataset_config = {
+            "batch_size": calib_batch_size,
+            "data_dir": calib_dataset_path
+        }
+        cali_dataloader, _ = get_dataloader(
+            dataset_name=calibrate_dataset_name,
+            dataset_config=dataset_config,
+            vae=self.vae, tokenizer=self.tokenizer, text_encoder=self.text_encoder,
+        )
+
+        print(f">> [{time.time() - cur_time:.2f}] Finish loading dataset "
+              f"{calibrate_dataset_name} with size {len(cali_dataloader)}")
+
+        # Fetch the calibration batch BEFORE offloading VAE/text encoder to
+        # CPU, because the dataloader's __getitem__ uses them for on-the-fly
+        # encoding (MJHQ-30K encodes images with the VAE at fetch time).
+        calib_batch = next(iter(cali_dataloader))
+
+        # Build batch_data dict once from the fetched calib_batch.
+        batch_data = {
+            "x": calib_batch[0].to(self.device, dtype=self.dtype),
+            "encoder_hidden_states": calib_batch[1].to(self.device, dtype=self.dtype),
+        }
+
+        # Offload text encoder and VAE to CPU to free GPU memory for the
+        # computation graph (Cayley rotation backward graph is large).
+        self._offload_to_cpu()
+
+        cur_time = time.time()
+        if test_mode:
+            ref_model = None
+        else:
+            ref_model = self.build_reference_model()
+        # Keep ref_model as an attribute so ``_clear_intermediates`` can reset
+        # its stored tensors each iteration. The reference model also needs
+        # ``store_intermediates=True`` so layer-wise loss can read each module's
+        # ``.output`` without hooks (compute_distillation_loss must not use hooks).
+        print(f">> [{time.time() - cur_time:.2f}] Finish building reference model")
+
+        # Enable intermediate storage in NVFP4Linear on BOTH the quantized
+        # transformer and the reference model: the quantized model exposes
+        # (x_eff, W_eff, x_quant, W_quant) for module-wise loss, and both
+        # models expose ``.output`` for layer-wise loss.
+        for model_to_cfg in (self.transformer, ref_model):
+            for _, module in model_to_cfg.named_modules():
+                if hasattr(module, 'store_intermediates'):
+                    module.store_intermediates = True
+
+        memory_check("Memory after ref_model")
+
+        # Collect Cayley rotation K parameters (the only learnable params here).
+        rot_instances = []
+        k_params = []
+        for name, module in self.transformer.named_modules():
+            if isinstance(module, CayleyRotation):
+                rot_instances.append(module)
+                k_params.append(module.K)
+        optimizer = torch.optim.Adam(k_params, lr=lr)
+        print(f">> [Optimizer] Finish initializing optimizer with [{len(rot_instances)}] rotations")
+
+        pbar = tqdm(total=iters, desc="[Cayley Calibration]", bar_format="{l_bar}{bar:20}{r_bar}{bar:-20b}", ncols=100)
+
+        iterations_metrics = {}
+        opt_loss_dict = {}
+        final_opt_loss = 0.0
+
+        for iter_idx in range(iters):
+
+            optimizer.zero_grad()
+
+            if iter_idx == 0:
+                memory_check("GPU mem iter 0 start")
+                print("\n")
+
+            # compute_distillation_loss returns (latents, step_error_info, loss).
+            # test_mode image decode is done here via _decode_latents_to_images,
+            # NOT inside compute_distillation_loss, to keep loss computation
+            # decoupled from visualisation.
+            latents, step_error_info, loss = self.compute_distillation_loss(
+                ref_model, batch_data, criterion, num_steps,
+                single_step_mode=single_step_mode,
+            )
+            if test_mode and iter_idx == 0:
+                images = self._decode_latents_to_images(latents)
+                nrow = calib_batch_size or calib_n_sample or 4
+                save_path = save_path or "."
+                os.makedirs(save_path, exist_ok=True)
+                save_sample_grid(images, os.path.join(save_path, "test.png"), nrow=nrow)
+                print(f" >> [Monitor] Cayley Update Test images saved to: {os.path.join(save_path, 'test.png')}")
+
+            loss_val = loss.item()
+            loss.backward()
+            optimizer.step()
+
+            # Store raw step_error_info — aggregation happens in plot_cayley_loss.
+            step_error_info["opt_loss"] = loss_val
+            iterations_metrics[iter_idx] = step_error_info
+            opt_loss_dict[iter_idx] = loss_val
+            final_opt_loss = loss_val
+
+            dit_sum = step_error_info.get("dit_loss_sum", 0.0)
+            pbar.set_postfix({"Loss": f"{loss_val:.4e}", "dit": f"{dit_sum:.4e}"})
+            pbar.update(1)
+
+            del loss
+            # Clear stored intermediates to free GPU memory before the next
+            # forward pass (avoids OOM from stale tensor references).
+            self._clear_intermediates([self.transformer, ref_model])
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if iter_idx == 0:
+                memory_check("GPU mem iter 0 after backward+clear")
+
+        pbar.close()
+
+        # Synchronize GPU before cleanup to avoid "device not ready" errors.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        # Free calibration graph and intermediates.
+        self._clear_intermediates([self.transformer, ref_model])
+        del ref_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Restore VAE / text encoder to GPU for downstream generation.
+        self._restore_to_gpu()
+        if torch.cuda.is_available():
+            # Sync after restore so subsequent generate() doesn't hit
+            # "device not ready" from pending async copies.
+            torch.cuda.synchronize()
+
+        # Wrap raw per-iteration metrics into the structure expected by
+        # plot_cayley_loss: {"iterations": {...}, "opt_loss": {...},
+        # "criterion": str, "final": float}.
+        error_info = {
+            "iterations": iterations_metrics,
+            "opt_loss": opt_loss_dict,
+            "criterion": criterion,
+            "final": final_opt_loss,
+        }
+
         if save_path is not None:
             os.makedirs(save_path, exist_ok=True)
-            plot_path = os.path.join(save_path, "cayley_step_loss.png")
-            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-            print(f"Step loss plot saved to: {plot_path}")
-        plt.close()
+            error_path = os.path.join(save_path, "cayley_error_info.json")
+            with open(error_path, 'w') as f:
+                json.dump(error_info, f, indent=2)
+            print(f"Error info saved to: {error_path}")
 
-        if step_keys:
-            module_loss = stats[step_keys[0]].get('module_loss', {})
-            if module_loss:
-                fig, axes = plt.subplots(1, 1, figsize=(12, 6))
-                modules = list(module_loss.keys())
-                act_losses = [module_loss[m].get('act', 0) for m in modules]
-                param_losses = [module_loss[m].get('param', 0) for m in modules]
-
-                x = range(len(modules))
-                width = 0.35
-                axes.bar([i - width/2 for i in x], act_losses, width, label='Activation Loss')
-                axes.bar([i + width/2 for i in x], param_losses, width, label='Parameter Loss')
-                axes.set_xlabel('Module')
-                axes.set_ylabel('Quantization Error')
-                axes.set_title('Module-wise Quantization Error')
-                axes.legend()
-                axes.grid(True, alpha=0.3)
-                plt.xticks(x, modules, rotation=90)
-                plt.tight_layout()
-
-                if save_path is not None:
-                    plot_path = os.path.join(save_path, "module_loss.png")
-                    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-                    print(f"Module loss plot saved to: {plot_path}")
-                plt.close()
+        return error_info
 
     # ==================================================================
     # Common: load_pipe (to be overridden by subclasses)
@@ -921,7 +1451,169 @@ class BaseImageGenerator:
     # Common: compute_distillation_loss (to be overridden by subclasses)
     # ==================================================================
 
-    def compute_distillation_loss(self, ref_model, batch_data, criterion, num_steps,
-                                  loss_fn=F.mse_loss, single_step_mode=True, **kwargs):
-        """Compute distillation loss. Override in subclasses."""
-        raise NotImplementedError("Subclasses must implement compute_distillation_loss")
+    def compute_distillation_loss(self, ref_model, batch_data, criterion, num_steps, loss_fn=F.mse_loss, single_step_mode=False, **kwargs):
+        """Compute distillation loss for the local DiT model.
+
+        Supports ``FlowMatchingScheduler`` and ``DDPMScheduler``.  No hooks —
+        all losses come from NVFP4Linear's exposed intermediates.
+        Noise is **randomly sampled** each call (not fixed) to enable proper
+        diffusion training loss (``dit_loss``) computation.
+
+        For each decode step:
+          1. Run the quantized ``self.transformer`` on ``x_t`` (with grad).
+          2. Run the unquantized ``ref_model`` (no grad).
+          3. Per-NVFP4Linear: module-wise (act+param) + layer-wise (output diff).
+          4. step-wise: ``loss_fn(output_target, output_ref)``.
+          5. dit_loss: standard diffusion training loss.
+             - FM: target = noise - x_0 (velocity), MSE(output, target)
+             - DDPM: target = noise, MSE(output, noise)
+          6. Record raw per-step ``error_info[step_idx]``.
+          7. ``scheduler.step`` to update latents.
+
+        Returns ``(latents, step_error_info, total_loss)`` where
+        ``step_error_info`` is the raw per-step dict (not aggregated).
+        """
+        hidden_states = batch_data.get('x')
+        encoder_hidden_states = batch_data.get('encoder_hidden_states')
+
+        # Random noise each call — enables proper diffusion training loss.
+        noise = torch.randn_like(hidden_states)
+        clean_target = hidden_states
+
+        is_fm = isinstance(self.scheduler, FlowMatchingScheduler)
+        is_ddpm = isinstance(self.scheduler, DDPMScheduler)
+        if not (is_fm or is_ddpm):
+            raise ValueError(
+                f"Local DiT compute_distillation_loss only supports "
+                f"FlowMatchingScheduler / DDPMScheduler, got {type(self.scheduler)}"
+            )
+
+        # ---- Scheduler timesteps -----------------------------------------------
+        # DDPM exposes set_timesteps(); FlowMatchingScheduler does not (its
+        # t are continuous in [0,1]). For FM we build a decreasing sequence
+        # 1→0 so the decode loop walks the probability-flow ODE from noise
+        # toward data, matching how trainer.sample_time is used at training.
+        if is_ddpm:
+            self.scheduler.set_timesteps(num_steps, device=self.device)
+            boundary_timesteps = self.scheduler.timesteps.to(self.device)
+            timesteps = boundary_timesteps[:-1] if len(boundary_timesteps) == num_steps + 1 else boundary_timesteps
+        else:  # FlowMatchingScheduler
+            # Boundary points t=1 (pure noise) → t=0 (clean data), num_steps+1
+            # points → num_steps transitions. Each transition uses dt = t_{n+1}-t_n.
+            boundary_timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=self.device)
+            timesteps = boundary_timesteps[:-1]  # num_steps entries
+
+        if single_step_mode:
+            sampled_step_idx = torch.randint(0, num_steps, (1,)).item()
+            steps_to_run = [sampled_step_idx]
+        else:
+            steps_to_run = list(range(num_steps))
+
+        # ---- Accumulators (float32) ---------------------------------------------
+        loss_acm_act = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_acm_param = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_acm_layer_wise = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_acm_step_wise = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_acm_dit = torch.zeros((), device=self.device, dtype=torch.float32)
+        error_info = {}
+
+        # ---- Helper: mix x_0 and noise at timestep t ----------------------------
+        def _mix(t_scalar):
+            t_batch = t_scalar.expand(hidden_states.shape[0])
+            t_e = t_batch.view(-1, *([1] * (hidden_states.dim() - 1)))
+            if is_fm:
+                return (1 - t_e) * clean_target + t_e * noise
+            else:  # DDPM
+                # Use scheduler.add_noise for correct DDPM schedule
+                return self.scheduler.add_noise(clean_target, noise, t_batch)
+
+        # ---- Initialise decode-loop latents -------------------------------------
+        t_init = boundary_timesteps[0]
+        x_t_target = _mix(t_init).to(self.dtype)
+        x_t_ref = x_t_target.detach().clone()
+        # print(steps_to_run)
+        for i in steps_to_run:
+            # print(f"Step: {i}")
+            step_module_loss_dict = {}
+            step_layer_loss_dict = {}
+
+            t = timesteps[i] if i < len(timesteps) else boundary_timesteps[-1]
+            t_batch = t.expand(hidden_states.shape[0]).to(self.dtype)
+
+            # --- Transformer forward (quantized target, with grad) --------------
+            output_target = self.transformer(x_t_target, t_batch, encoder_hidden_states)
+
+            # --- Reference transformer forward (no grad) -------------------------
+            with torch.no_grad():
+                output_ref = ref_model(x_t_ref, t_batch, encoder_hidden_states)
+
+            # --- Per-NVFP4Linear losses (no hooks — stored intermediates) --------
+            for name, module in self.transformer.named_modules():
+                if isinstance(module, NVFP4Linear):
+                    # module-wise
+                    loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
+                    step_module_loss_dict[name] = {
+                        "act": float(loss_act.item()),
+                        "param": float(loss_param.item()),
+                    }
+                    loss_acm_act = loss_acm_act + loss_act.to(torch.float32)
+                    loss_acm_param = loss_acm_param + loss_param.to(torch.float32)
+
+                    # layer-wise: per-module output diff (vs ref model)
+                    output_ref_mod = ref_model.get_submodule(name).output
+                    loss_layer_wise = loss_fn(output_ref_mod.detach(), module.output)
+                    step_layer_loss_dict[name] = float(loss_layer_wise.item())
+                    loss_acm_layer_wise = loss_acm_layer_wise + loss_layer_wise.to(torch.float32)
+
+            # --- step-wise: DiT output diff ---------------------------------------
+            loss_step_wise = loss_fn(output_target, output_ref)
+            loss_acm_step_wise = loss_acm_step_wise + loss_step_wise.to(torch.float32)
+
+            # --- dit_loss: standard diffusion training loss ----------------------
+            if is_fm:
+                # Flow Matching: target = noise - x_0 (velocity)
+                target_velocity = noise.float() - clean_target.float()
+                dit_loss = loss_fn(output_target.float(), target_velocity.detach())
+            else:
+                # DDPM: target = noise (epsilon prediction)
+                dit_loss = loss_fn(output_target.float(), noise.float().detach())
+            loss_acm_dit = loss_acm_dit + dit_loss.to(torch.float32)
+
+            # --- Record raw per-step error_info ----------------------------------
+            error_info[0 if single_step_mode else i] = {
+                "module_loss": step_module_loss_dict,
+                "layer_loss": step_layer_loss_dict,
+                "step_loss": float(loss_step_wise.item()),
+                "dit_loss": float(dit_loss.item()),
+            }
+
+            # --- Scheduler step --------------------------------------------------
+            # FM: x_{t+dt} = x_t + v·dt  where dt = t_{n+1} - t_n (< 0).
+            # DDPM: use scheduler.step (its schedule-aware formula).
+            if is_fm:
+                dt = (boundary_timesteps[i + 1] - boundary_timesteps[i]) if (i + 1) < len(boundary_timesteps) else -1.0 / num_steps
+                x_t_target = x_t_target + output_target * dt
+                with torch.no_grad():
+                    x_t_ref = x_t_ref + output_ref * dt
+            else:
+                x_t_target = self.scheduler.step(
+                    output_target, t_batch, x_t_target, return_dict=False,
+                )[0]
+                with torch.no_grad():
+                    x_t_ref = self.scheduler.step(
+                        output_ref, t_batch, x_t_ref, return_dict=False,
+                    )[0]
+
+        error_info["dit_loss_sum"] = float(loss_acm_dit.item())
+
+        # ---- Criterion selection (strict) ---------------------------------------
+        if criterion == "module-wise":
+            total_loss = loss_acm_act + loss_acm_param
+        elif criterion == "layer-wise":
+            total_loss = loss_acm_layer_wise
+        elif criterion == "step-wise":
+            total_loss = loss_acm_step_wise
+        else:
+            raise ValueError(f"Criterion type {criterion} is not supported.")
+
+        return x_t_target, error_info, total_loss

@@ -131,10 +131,10 @@ class NVFP4Linear(nn.Linear):
                 self.block_size,
                 quantization_error_info, act_prefix,
             )
-            x_quant = xq3d.reshape(orig_shape)
+            x_quant = xq3d.reshape(orig_shape).to(W_quant.dtype)
         else:
             W_quant = W_eff
-            x_quant = x_eff
+            x_quant = x_eff.to(W_quant.dtype)
         output = F.linear(x_quant, W_quant, self.bias)
 
         # Only store intermediates when explicitly requested (e.g. during

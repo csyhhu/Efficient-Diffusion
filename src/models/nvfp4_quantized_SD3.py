@@ -38,6 +38,7 @@ import gc
 import json
 from typing import Optional, List, Any
 from types import SimpleNamespace
+import time
 
 import torch
 import torch.nn as nn
@@ -581,11 +582,12 @@ class JointAttention(nn.Module):
         # QK norm (optional)
         self.qk_norm = qk_norm
         if qk_norm == "rms_norm":
-            self.norm_q = nn.RMSNorm(head_dim, eps=1e-6)
-            self.norm_k = nn.RMSNorm(head_dim, eps=1e-6)
+            from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
+            self.norm_q = DiffusersRMSNorm(head_dim, eps=1e-6)
+            self.norm_k = DiffusersRMSNorm(head_dim, eps=1e-6)
             if has_added_kv:
-                self.norm_added_q = nn.RMSNorm(head_dim, eps=1e-6)
-                self.norm_added_k = nn.RMSNorm(head_dim, eps=1e-6)
+                self.norm_added_q = DiffusersRMSNorm(head_dim, eps=1e-6)
+                self.norm_added_k = DiffusersRMSNorm(head_dim, eps=1e-6)
             else:
                 self.norm_added_q = None
                 self.norm_added_k = None
@@ -606,66 +608,68 @@ class JointAttention(nn.Module):
         """Args:
             hidden_states: (B, N_img, D) image tokens.
             encoder_hidden_states: (B, N_txt, D) text tokens (ignored when
-                ``has_added_kv=False``).
+            ``has_added_kv=False``).
         Returns:
             attn_img: (B, N_img, D), attn_txt: (B, N_txt, D) or None.
         """
+        batch_size = hidden_states.shape[0]
+        n_img = hidden_states.shape[1]
+
         # Image Q, K, V
-        q_img = self._split_heads(
-            self.to_q(hidden_states, quantization_error_info))
-        k_img = self._split_heads(
-            self.to_k(hidden_states, quantization_error_info))
-        v_img = self._split_heads(
-            self.to_v(hidden_states, quantization_error_info))
+        query = self.to_q(hidden_states, quantization_error_info)
+        key = self.to_k(hidden_states, quantization_error_info)
+        value = self.to_v(hidden_states, quantization_error_info)
+
+        query = query.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # QK norm on image Q/K BEFORE concat (matches diffusers)
+        if self.qk_norm == "rms_norm":
+            query = self.norm_q(query)
+            key = self.norm_k(key)
 
         # Pure self-attention path (attn2 in SD3.5 dual-attention blocks):
-        # no added KV, image attends only to itself, no text output.
         if not self.has_added_kv:
-            k = k_img
-            v = v_img
-            if self.qk_norm == "rms_norm":
-                q_img = self.norm_q(q_img)
-                k = self.norm_k(k)
-            attn_img = F.scaled_dot_product_attention(q_img, k, v)
-            attn_img = self._merge_heads(attn_img)
-            attn_img = self.to_out[0](attn_img, quantization_error_info)
-            attn_img = self.to_out[1](attn_img)
-            return attn_img, None
+            attn_output = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+            attn_output = attn_output.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
+            attn_output = attn_output.to(query.dtype)
+            attn_output = self.to_out[0](attn_output, quantization_error_info)
+            attn_output = self.to_out[1](attn_output)
+            return attn_output, None
 
-        # Text K, V
-        k_txt = self._split_heads(
-            self.add_k_proj(encoder_hidden_states, quantization_error_info))
-        v_txt = self._split_heads(
-            self.add_v_proj(encoder_hidden_states, quantization_error_info))
+        # Text (context) Q, K, V
+        encoder_query = self.add_q_proj(encoder_hidden_states, quantization_error_info)
+        encoder_key = self.add_k_proj(encoder_hidden_states, quantization_error_info)
+        encoder_value = self.add_v_proj(encoder_hidden_states, quantization_error_info)
 
-        if not self.context_pre_only:
-            q_txt = self._split_heads(
-                self.add_q_proj(encoder_hidden_states, quantization_error_info))
+        encoder_query = encoder_query.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        encoder_key = encoder_key.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        encoder_value = encoder_value.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Concatenate -> image attends to [image + text]
-        k = torch.cat([k_img, k_txt], dim=2)
-        v = torch.cat([v_img, v_txt], dim=2)
-
-        # QK norm
+        # QK norm on text Q/K BEFORE concat (matches diffusers)
         if self.qk_norm == "rms_norm":
-            q_img = self.norm_q(q_img)
-            k = self.norm_k(k)
+            encoder_query = self.norm_added_q(encoder_query)
+            encoder_key = self.norm_added_k(encoder_key)
 
-        # Joint attention: image queries
-        attn_img = F.scaled_dot_product_attention(q_img, k, v)
-        attn_img = self._merge_heads(attn_img)
+        # Concatenate image + text, single SDPA call (matches diffusers)
+        query = torch.cat([query, encoder_query], dim=2)
+        key = torch.cat([key, encoder_key], dim=2)
+        value = torch.cat([value, encoder_value], dim=2)
+
+        attn_output = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
+        attn_output = attn_output.to(query.dtype)
+
+        # Split attention outputs
+        attn_img, attn_txt = attn_output[:, :n_img], attn_output[:, n_img:]
+
         attn_img = self.to_out[0](attn_img, quantization_error_info)
         attn_img = self.to_out[1](attn_img)
 
         if self.context_pre_only:
             return attn_img, None
 
-        # Joint attention: text queries
-        if self.qk_norm == "rms_norm":
-            q_txt = self.norm_added_q(q_txt)
-            k = self.norm_added_k(k)
-        attn_txt = F.scaled_dot_product_attention(q_txt, k, v)
-        attn_txt = self._merge_heads(attn_txt)
         attn_txt = self.to_add_out(attn_txt, quantization_error_info)
         return attn_img, attn_txt
 
@@ -1051,10 +1055,8 @@ class NVFP4QuantizedSD3(nn.Module):
 
         Args:
             ref_model: Optional pre-loaded SD3Transformer2DModel to copy weights
-                       from. If None, loads the reference model from disk.
+                       from. If None, loads weights directly from the checkpoint.
         """
-        from diffusers import SD3Transformer2DModel
-
         download_source = (download_source
                            or os.environ.get("DOWNLOAD_SOURCE", "modelscope").lower())
 
@@ -1077,51 +1079,85 @@ class NVFP4QuantizedSD3(nn.Module):
               f"head_dim={cfg.get('attention_head_dim')}, "
               f"inner_dim={inner_dim}")
 
-        # Step 3: build model with config dimensions
-        model = cls(
-            sample_size=cfg.get("sample_size", 128),
-            patch_size=cfg.get("patch_size", 2),
-            in_channels=cfg.get("in_channels", 16),
-            out_channels=cfg.get("out_channels") or cfg.get("in_channels", 16),
-            num_layers=cfg["num_layers"],
-            attention_head_dim=cfg["attention_head_dim"],
-            num_attention_heads=cfg["num_attention_heads"],
-            joint_attention_dim=cfg.get("joint_attention_dim", 4096),
-            caption_projection_dim=cfg.get("caption_projection_dim", inner_dim),
-            pooled_projection_dim=cfg.get("pooled_projection_dim", 2048),
-            pos_embed_max_size=cfg.get("pos_embed_max_size", 96),
-            dual_attention_layers=cfg.get("dual_attention_layers", ()),
-            qk_norm=cfg.get("qk_norm", "rms_norm"),
-            block_size=block_size,
-            use_nvfp4=use_nvfp4,
-            rotation=rotation,
-            permutation=permutation,
-        )
+        # Step 3: build model
+        # Create on meta device: zero memory allocation.
+        # assign=True replaces meta tensors with checkpoint tensors.
+        # This avoids allocating ~5GB of random weights that are
+        # immediately discarded.
+        _t0 = time.time()
+        with torch.device('meta'):
+            model = cls(
+                sample_size=cfg.get("sample_size", 128),
+                patch_size=cfg.get("patch_size", 2),
+                in_channels=cfg.get("in_channels", 16),
+                out_channels=cfg.get("out_channels") or cfg.get("in_channels", 16),
+                num_layers=cfg["num_layers"],
+                attention_head_dim=cfg["attention_head_dim"],
+                num_attention_heads=cfg["num_attention_heads"],
+                joint_attention_dim=cfg.get("joint_attention_dim", 4096),
+                caption_projection_dim=cfg.get("caption_projection_dim", inner_dim),
+                pooled_projection_dim=cfg.get("pooled_projection_dim", 2048),
+                pos_embed_max_size=cfg.get("pos_embed_max_size", 96),
+                dual_attention_layers=cfg.get("dual_attention_layers", ()),
+                qk_norm=cfg.get("qk_norm", "rms_norm"),
+                block_size=block_size,
+                use_nvfp4=use_nvfp4,
+                rotation=rotation,
+                permutation=permutation,
+            )
+            # print(f"  [timing] model creation (meta): {time.time() - _t0:.2f}s")
 
-        # Convert to target dtype BEFORE loading reference model.
-        # This halves peak memory: model goes from float32 (~10GB) to
-        # bfloat16 (~5GB) before the reference model is loaded.
+        # Step 4: load weights
+        # Load checkpoint directly. Our model is a structural replica of
+        # SD3Transformer2DModel so checkpoint keys match; only extra
+        # rotation/permutation buffers are absent (strict=False).
+        import glob
+        from safetensors.torch import load_file as load_safetensors
+
+        _t2 = time.time()
+        ckpt_dir = os.path.join(local_path, subfolder)
+        state_dict = {}
+        safetensors_files = sorted(glob.glob(os.path.join(ckpt_dir, "*.safetensors")))
+        if safetensors_files:
+            for f in safetensors_files:
+                state_dict.update(load_safetensors(f))
+        else:
+            bin_files = sorted(glob.glob(os.path.join(ckpt_dir, "*.bin")))
+            if not bin_files:
+                raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
+            for f in bin_files:
+                state_dict.update(torch.load(f, map_location="cpu"))
+        # print(f"  [timing] safetensors load: {time.time() - _t2:.2f}s")
+
+        _t3 = time.time()
+            # assign=True replaces meta tensors with loaded tensors (no copy).
+            # ~1000x faster than copy_() for large models.
+        missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)    
+        # print(f"  [timing] load_state_dict: {time.time() - _t3:.2f}s")
+
+        real_missing = [k for k in missing if not any(s in k for s in ('_rotation', '_R_init', 'permutation'))]
+        if real_missing:
+            print(f"Warning: {len(real_missing)} missing keys, first 5: {real_missing[:5]}")
+        if unexpected:
+            print(f"Warning: {len(unexpected)} unexpected keys, first 5: {unexpected[:5]}")
+        # Check for remaining meta tensors (rotation/permutation buffers
+        # not present in checkpoint)
+        meta_params = [n for n, p in model.named_parameters() if p.is_meta]
+        meta_buffers = [n for n, b in model.named_buffers() if b.is_meta]
+        if meta_params or meta_buffers:
+            print(f"  [info] {len(meta_params) + len(meta_buffers)} meta tensors "
+                    f"remaining, materializing rotation/permutation...")
+            for module in model.modules():
+                if isinstance(module, NVFP4Linear):
+                    if module.rotation is not None and hasattr(module.rotation, 'fit'):
+                        module.rotation.fit()
+                    if module.permutation is not None and hasattr(module.permutation, 'fit'):
+                        module.permutation.fit(module.weight)
+        # Convert to target dtype (no-op if already matching)
         model = model.to(dtype=torch_dtype)
 
-        # Step 4: load reference model & copy weights
-        # If ref_model is provided, use it directly (avoids double-loading).
-        _should_del_ref = ref_model is None
-        if ref_model is None:
-            # low_cpu_mem_usage=True avoids creating a full state_dict copy
-            # during loading (uses meta device + direct weight assignment).
-            ref = SD3Transformer2DModel.from_pretrained(
-                local_path, subfolder=subfolder, local_files_only=True,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=True,
-            )
-        else:
-            ref = ref_model
-
-        model._copy_weights(ref)
-
-        if _should_del_ref:
-            del ref
-            gc.collect()
+        del state_dict
+        gc.collect()
 
         return model
 
@@ -1368,12 +1404,12 @@ class NVFP4QuantizedSD3(nn.Module):
         return type("Transformer2DModelOutput", (), {"sample": output})()
 
 
-# ===========================================================================
-# Smoke test — original vs quantized comparison
-# ===========================================================================
-
 if __name__ == "__main__":
 
+    """
+    python -m src.models.nvfp4_quantized_SD3
+    """
+    import time
     from diffusers import SD3Transformer2DModel
 
     bs = 2
@@ -1381,8 +1417,8 @@ if __name__ == "__main__":
     height = 16
     width = 16
     n_txt = 32
-    joint_attention_dim = 64       # T5/CLIP hidden dim (small for smoke test)
-    pooled_projection_dim = 32     # pooled text dim
+    joint_attention_dim = 4096      # SD3.5-medium text embedding dim
+    pooled_projection_dim = 2048    # SD3.5-medium pooled projection dim
     # dtype = torch.float32
     dtype = torch.bfloat16
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1398,21 +1434,51 @@ if __name__ == "__main__":
     attention_head_dim = inner_dim // num_attention_heads  # 32
     caption_projection_dim = inner_dim  # must equal inner_dim for SD3
 
+    """
+    cur = time.time()
+    model = NVFP4QuantizedSD3.from_pretrained(
+        "G://models//stabilityai//stable-diffusion-3.5-medium",
+        cache_dir="G://models",
+        local_files_only=True,
+        torch_dtype=dtype,
+        rotation="identity",
+        permutation="identity",
+        nvfp4_quantize=False,
+    ).to(device, dtype=dtype)
+    
+    load_time = time.time() - cur
+    print(f"Model loading time: {load_time:.4f} seconds")
+    gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+    print(f"Peak GPU memory: {gpu_mem:.2f} GB")
+    import psutil
+    rss = psutil.Process().memory_info().rss / 1024**3
+    print(f"Process RSS: {rss:.2f} GB")
+    """
+    
+    # """
     # ---- Original diffusers SD3Transformer2DModel ----
-    model_ori = SD3Transformer2DModel(
-        sample_size=16,
-        patch_size=2,
-        in_channels=in_channels,
-        out_channels=in_channels,
-        num_layers=2,
-        attention_head_dim=attention_head_dim,
-        num_attention_heads=num_attention_heads,
-        joint_attention_dim=joint_attention_dim,
-        caption_projection_dim=caption_projection_dim,
-        pooled_projection_dim=pooled_projection_dim,
-        pos_embed_max_size=16,
-        dual_attention_layers=(),
-        qk_norm="rms_norm",
+    # model_ori = SD3Transformer2DModel(
+    #     sample_size=16,
+    #     patch_size=2,
+    #     in_channels=in_channels,
+    #     out_channels=in_channels,
+    #     num_layers=2,
+    #     attention_head_dim=attention_head_dim,
+    #     num_attention_heads=num_attention_heads,
+    #     joint_attention_dim=joint_attention_dim,
+    #     caption_projection_dim=caption_projection_dim,
+    #     pooled_projection_dim=pooled_projection_dim,
+    #     pos_embed_max_size=16,
+    #     dual_attention_layers=(),
+    #     qk_norm="rms_norm",
+    # ).to(device, dtype=dtype)
+    cur = time.time()
+    model_ori = SD3Transformer2DModel.from_pretrained(
+        "G://models//stabilityai//stable-diffusion-3.5-medium",
+        subfolder="transformer",
+        cache_dir="G://models",
+        local_files_only=True,
+        torch_dtype=dtype
     ).to(device, dtype=dtype)
 
     y_ori = model_ori(
@@ -1420,40 +1486,39 @@ if __name__ == "__main__":
         return_dict=True,
     ).sample
     print(f"Original model output shape: {y_ori.shape}")
+    load_time = time.time() - cur
+    print(f"Origin model loading+forward time: {load_time:.4f} seconds")
 
-    # ---- Compare with NVFP4QuantizedSD3 under various configs ----
-    rots = [None, "identity"]
-    perms = [None, "identity"]
-    for rot in rots:
-        for perm in perms:
-            for quantize in [False, True]:
-                model_rpq = NVFP4QuantizedSD3(
-                    sample_size=16,
-                    patch_size=2,
-                    in_channels=in_channels,
-                    out_channels=in_channels,
-                    num_layers=2,
-                    attention_head_dim=attention_head_dim,
-                    num_attention_heads=num_attention_heads,
-                    joint_attention_dim=joint_attention_dim,
-                    caption_projection_dim=caption_projection_dim,
-                    pooled_projection_dim=pooled_projection_dim,
-                    pos_embed_max_size=16,
-                    dual_attention_layers=(),
-                    qk_norm="rms_norm",
+    # Free origin model to save memory for NVFP4 model
+    del model_ori
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # ---- Compare with NVFP4QuantizedSD3 ----
+    for rot in ["identity"]:
+        for perm in ["identity"]:
+            for quantize in [False]:
+                cur = time.time()
+                model_rpq = NVFP4QuantizedSD3.from_pretrained(
+                    "G://models//stabilityai//stable-diffusion-3.5-medium",
+                    cache_dir="G://models",
+                    local_files_only=True,
+                    torch_dtype=dtype,
                     use_nvfp4=quantize,
                     rotation=rot,
-                    permutation=perm,
+                    permutation=perm
                 ).to(device, dtype=dtype)
-                # strict=False: rotation/permutation create extra buffers
-                # (e.g. IdentityRotation._rotation) not present in the original
-                # model's state_dict.
-                model_rpq.load_state_dict(model_ori.state_dict(), strict=False)
+                print(f"rpq model loading time: {time.time() - cur:.4f}")
                 y_rpq = model_rpq(
                     hidden_states, encoder_hidden_states, pooled_projections,
                     timestep, return_dict=True,
                 ).sample
-
                 diff = torch.mean(torch.abs(y_rpq - y_ori))
                 print(f"[rot={rot}-perm={perm}-quantize={quantize}] "
                       f"MAE between original and quantized model: {diff:.6e}")
+                del model_rpq
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+

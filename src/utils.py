@@ -23,6 +23,22 @@ import torch.nn as nn
 
 from PIL import Image
 
+import psutil
+
+import logging
+_LOG_CONFIG = {
+    'level': logging.INFO,
+    'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    'datefmt': '%Y-%m-%d %H:%M:%S',
+    'log_dir': 'logs'
+}
+
+def memory_check(prefix: str = ""):
+    gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+    print(f">> [Monitor] {prefix} Peak GPU memory: {gpu_mem:.2f} GB")
+    rss = psutil.Process().memory_info().rss / 1024**3
+    print(f">> [Monitor] {prefix} Process RSS: {rss:.2f} GB")
+
 
 def load_config(config_path: str) -> dict:
     """Load YAML config file and return a plain dict.

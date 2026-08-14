@@ -101,7 +101,7 @@ def make_permutation(value, seed=None):
     Returns:
         Callable: function that creates a permutation instance
     """
-    if value is None:
+    if value is None or value in ["None", "none"]:
         return None
     elif value == "identity":
         return IdentityPermutation()

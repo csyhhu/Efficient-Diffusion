@@ -308,16 +308,20 @@ class COCO2017RawDataset(Dataset):
         image_size: int = 512,
         max_samples: int = -1,
         cache_dir: Optional[str] = None,
+        local_files_only: bool = True,
     ):
         self.image_size = image_size
         self.transform = transforms.Compose([
-            transforms.Resize(image_size),
+            transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ])
+        data_dir = f"{data_dir}/modelscope/COCO2017_Instance_Segmentation/master/data_files//extracted//d376d18ebab3e013b155c78acc3f3b8fb038e6e910724cc2f0482441efa5a74a/COCO2017val"
 
         # Resolve image dir + annotation file
-        if data_dir and os.path.isdir(data_dir):
+        if local_files_only or data_dir:
+            if not os.path.isdir(data_dir):
+                raise ValueError(f"local_files_only=True, but data_dir={data_dir} is not a directory")
             img_dir = os.path.join(data_dir, "val2017")
             ann_dir = os.path.join(data_dir, "annotations")
             ann_file = None
@@ -469,7 +473,7 @@ def get_coco2017_dataloader(
     train: bool = False,
     data_dir: Optional[str] = None,
     cache_dir: Optional[str] = None,
-    image_size: int = 512,
+    image_size: int = 256,
     max_samples: int = -1,
     num_workers: int = 0,
     pin_memory: bool = False,
@@ -543,6 +547,10 @@ def get_coco2017_dataloader(
             cache_dir=cache_dir,
         )
 
+    # drop_last only makes sense for training: a partial final batch would
+    # skew training statistics.  For validation / test we must keep the last
+    # (possibly partial) batch, otherwise datasets smaller than batch_size
+    # yield zero batches and ``next(iter(loader))`` raises StopIteration.
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -550,7 +558,7 @@ def get_coco2017_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        drop_last=True,
+        drop_last=train,
     )
 
     return loader
@@ -565,6 +573,9 @@ if __name__ == "__main__":
     # import sys
     # sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     # os.makedirs("./outputs", exist_ok=True)
+    """
+    python -m src.data.coco2017
+    """
 
     # ---- Test 1: Raw DataLoader (small subset) ----
     print("=" * 60)
@@ -576,8 +587,8 @@ if __name__ == "__main__":
         train=False,
         image_size=256,
         max_samples=50,
-        cache_dir="G://datasets",
-        # data_dir=r"G://datasets//coco2017",  # uncomment to use local
+        # cache_dir="G://datasets",
+        data_dir=r"G://datasets//",  # uncomment to use local
     )
     images, labels, prompts = next(iter(val_loader))
     print(f"  Val batches: {len(val_loader)}")
@@ -587,10 +598,10 @@ if __name__ == "__main__":
     print(f"  Sample prompts:")
     for i, p in enumerate(prompts[:5]):
         print(f"    {i+1}. {p}")
-    print("[OK] Raw DataLoader test passed.\n")
+    # print("[OK] Raw DataLoader test passed.\n")
 
     # ---- Test 2: Latent DataLoader (requires real models) ----
-    """
+    # """
     from src.utils import _find_or_download_component
     from diffusers import AutoencoderKL
     from transformers import BertTokenizer, BertModel, BertConfig
@@ -624,11 +635,12 @@ if __name__ == "__main__":
 
     val_loader = get_coco2017_dataloader(
         batch_size=4, train=False, image_size=256, max_samples=20,
+        data_dir=r"G://datasets//",  # use local data (same as Test 1)
         vae=vae, tokenizer=tokenizer, text_encoder=text_encoder,
         device=device, dtype=dtype,
     )
     latents, txt_embs = next(iter(val_loader))
     print(f"Latent shape: {tuple(latents.shape)}")
     print(f"Text emb shape: {tuple(txt_embs.shape)}")
-    print("[OK] Latent DataLoader test passed.")
-    """
+    # print("[OK] Latent DataLoader test passed.")
+    # """

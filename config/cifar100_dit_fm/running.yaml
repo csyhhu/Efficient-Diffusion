@@ -10,7 +10,7 @@ num_steps: 50            # number of sampling steps
 
 # ── Training ──
 lr: 0.0001               # learning rate (Adam)
-epochs: 100                # number of training epochs (reduced for testing)
+epochs: 1                # number of training epochs (reduced for testing)
 output_dir: "G:///Outputs/cifar100_dit_fm"  # output directory for checkpoints and samples
 test_prompt: "A cat"  # test prompt for sample generation
 

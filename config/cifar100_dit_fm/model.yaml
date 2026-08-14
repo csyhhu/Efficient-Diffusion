@@ -19,8 +19,8 @@ use_cross_attention: true
 cross_attention_dim: 768
 
 # Rotation and permutation for quantization
-rotation: "cayley"
-permutation: "identity"
+rotation: None
+permutation: None
 
 # Pipeline components (download via ModelScope)
 # Using iic/multi-modal_clip-vit-base-patch16_zh which is a Chinese CLIP model

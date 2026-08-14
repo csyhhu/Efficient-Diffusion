@@ -150,7 +150,7 @@ class CIFAR100RawDataset(Dataset):
     - prompt: str generated text prompt
     """
 
-    def __init__(self, root: str = "./data", train: bool = True, image_size: int = 64):
+    def __init__(self, root: str = "G://datasets//cifar-100-python", train: bool = True, image_size: int = 64):
         self.transform = transforms.Compose([
             transforms.Resize(image_size),
             transforms.ToTensor(),
@@ -183,7 +183,7 @@ class CIFAR100LatentDataset(Dataset):
 
     def __init__(
         self,
-        root: str = "./data",
+        root: str = "G://datasets//cifar-100-python",
         train: bool = True,
         image_size: int = 64,
         vae=None,
@@ -223,7 +223,17 @@ class CIFAR100LatentDataset(Dataset):
         prompt = generate_prompt(class_name)
 
         with torch.no_grad():
-            latent = self.vae.encode(image.unsqueeze(0).to(self.device, self.dtype)).latent_dist.sample()
+            encoder_output = self.vae.encode(image.unsqueeze(0).to(self.device, self.dtype))
+            if hasattr(encoder_output, "latent_dist"):
+                latent = encoder_output.latent_dist.sample()
+            elif hasattr(encoder_output, "latent"):
+                latent = encoder_output.latent
+            elif hasattr(encoder_output, "latents"):
+                latent = encoder_output.latents
+            elif isinstance(encoder_output, torch.Tensor):
+                latent = encoder_output
+            else:
+                latent = encoder_output
             latent = latent * self.vae_scale
 
             text_inputs = self.tokenizer(
@@ -248,7 +258,7 @@ class CIFAR100LatentDataset(Dataset):
 def get_cifar100_dataloader(
     batch_size: int = 128,
     train: bool = True,
-    root: str = "./data",
+    root: str = "G://datasets//cifar-100-python",
     image_size: int = 32,
     num_workers: int = 0,
     pin_memory: bool = False,
@@ -283,6 +293,10 @@ def get_cifar100_dataloader(
     Returns:
         DataLoader for CIFAR-100
     """
+    print(
+        f">> [data] Loading cifar100 from [{root}] [{image_size} x {image_size}] batch size: {batch_size}" 
+        f" using vae={vae is not None}, tokenizer={tokenizer is not None}, text_encoder={text_encoder is not None}"
+    )
     if vae is not None and tokenizer is not None and text_encoder is not None:
         dataset = CIFAR100LatentDataset(
             root=root,
@@ -383,8 +397,8 @@ if __name__ == "__main__":
     })
     text_encoder = BertModel(config).to(device).to(dtype)
     train_loader = get_cifar100_dataloader(
-        batch_size=16, train=True, image_size=64, 
-        root="G://datasets//cifar-100-python", 
+        # batch_size=16, train=True, image_size=64, 
+        # root="G://datasets//cifar-100-python", 
         vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, device=device, dtype=dtype
     )
     latents, txt_embs = next(iter(train_loader))

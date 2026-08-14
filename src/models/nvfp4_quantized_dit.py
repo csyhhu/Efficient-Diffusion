@@ -582,9 +582,9 @@ class NVFP4DiT(nn.Module):
         self._init_weights()
 
         self.quantization_error_info = {}
-        print(f"Initialize NVFP4-Quantized DiT (block_size={block_size}, "
-              f"hidden_dim={hidden_dim}, depth={depth}, heads={num_heads}, "
-              f"use_cross_attention={use_cross_attention})")
+       
+        print(f">> [Model] Initialize DiT Transformer {'Quantized' if use_nvfp4 else 'Unquantized'} mode, block_size={block_size}, "
+              f"rotation={rotation}, permutation={permutation}")
 
     def _init_weights(self):
         # Xavier init for final proj

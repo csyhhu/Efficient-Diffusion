@@ -220,7 +220,7 @@ def get_mqjh30k_dataloader(
     batch_size: int = 128,
     train: bool = True,
     root: str = "./data",
-    image_size: int = 512,
+    image_size: int = 1024,
     num_workers: int = 0,
     pin_memory: bool = False,
     persistent_workers: bool = False,
@@ -229,7 +229,7 @@ def get_mqjh30k_dataloader(
     text_encoder=None,
     device: torch.device = None,
     dtype: torch.dtype = torch.float32,
-    max_token_length: int = 77,
+    max_token_length: int = 300,
 ) -> DataLoader:
     """Create a MJHQ-30K DataLoader.
 

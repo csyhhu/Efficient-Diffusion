@@ -12,7 +12,7 @@ Usage::
         "pokemon", dataset_config, vae=vae, tokenizer=tokenizer,
     )
 """
-import os, sys
+import os, sys, inspect
 # Ensure project root is on sys.path so that ``from src.xxx`` works
 # regardless of how this file is invoked.
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +24,7 @@ import torch
 from src.data.mnist import get_mnist_dataloader
 from src.data.cifar import get_cifar100_dataloader
 from src.data.coco2017 import get_coco2017_dataloader
+from src.data.mqjh import get_mqjh30k_dataloader
 
 from src.data.t2i import (  # noqa: F401 – re-export everything
     LatentDataset,
@@ -49,10 +50,12 @@ _DEFAULT_TOKEN_LENGTHS = {"quantized_sd3": 77, "quantized_pixart": 300}
 
 def get_dataloader(
     dataset_name: str,
-    dataset_config: dict,
     vae=None,
     tokenizer=None,
-) -> tuple:
+    text_encoder=None,
+    dataset_config: dict = None,
+    **kwargs
+   ) -> tuple:
     """Create train and validation DataLoaders.
 
     Args:
@@ -65,34 +68,17 @@ def get_dataloader(
             | ``"pokemon"`` | ``"coco"`` | ``"flickr30k"`` | ``"cc12m"`` —
               T2I datasets requiring VAE and tokenizer.
         dataset_config:
-            Flat configuration dict.  Supported keys:
+            Flat configuration dict. Any key that matches a parameter of the
+            target ``get_xxx_dataloader`` is forwarded; keys the caller omits
+            fall back to that function's own defaults — this dispatcher holds
+            no duplicated defaults (edit the function to change a default).
 
-            **Common**
-            - ``dtype`` (str): compute dtype, e.g. ``"float16"`` (default ``"float16"``).
-            - ``batch_size`` (int): batch size (default ``8``).
-            - ``num_workers`` (int): DataLoader workers (default ``0``).
-            - ``pin_memory`` (bool): pin_memory for GPU (default ``False``).
-
-            **T2I only**
-            - ``max_samples`` (int): cap on training samples (default ``20000``).
-            - ``image_size`` (int): resize target (default ``256``).
-            - ``val_samples`` (int): number of validation samples (default ``1000``).
-            - ``cc12m_path`` (str): glob pattern for CC12M shards (required for cc12m).
-            - ``drop_last`` (bool): drop incomplete last batch (default ``True``).
-            - ``max_token_length`` (int): tokenizer max length (default ``77``).
-
-            **MNIST / CIFAR-100 only**
-            - ``data_dir`` (str): download / storage directory (default ``"./data"``).
-
-            **COCO2017 only**
-            - ``data_dir`` (str): local root with ``val2017/`` +
-              ``annotations/instances_val2017.json``.  If ``None`` or invalid,
-              downloads from ModelScope (PAI/COCO2017 validation split).
-            - ``cache_dir`` (str): ModelScope download cache override.
-            - ``image_size`` (int): resize target (default ``512``).
-            - ``max_samples`` (int): cap on images loaded from the annotation
-              JSON (-1 = all 5000 val images).
-            - ``max_token_length`` (int): tokenizer max length (default ``77``).
+            - ``data_dir`` is accepted for every dataset and is aliased to
+              ``root`` for CIFAR-100 / MJHQ-30K (whose functions name the path
+              argument ``root``).
+            - ``dtype`` is given as a string (e.g. ``"bfloat16"``) and resolved
+              to a ``torch.dtype`` automatically in latent mode (inheriting the
+              VAE dtype when omitted).
 
         vae:
             Frozen VAE (AutoencoderKL) for image→latent encoding.  Required
@@ -119,97 +105,60 @@ def get_dataloader(
         ``tokens_dict`` = ``{"input_ids": (B, seq_len), "attention_mask": (B, seq_len)}``.
     """
 
-    dataset_name_lower = dataset_name.lower()
+    # Normalise the config: tolerate ``None`` and fold in extra **kwargs so
+    # callers may pass options either as a dict or as keyword arguments.
+    dataset_config = dict(dataset_config or {})
+    dataset_config.update(kwargs)
 
     if dataset_name == "mnist":
-        mnist_cfg = {
-            "batch_size": dataset_config.get("batch_size", 128),
-            "data_dir": dataset_config.get("data_dir", "./data"),
-            "num_workers": dataset_config.get("num_workers", 0),
-            "pin_memory": dataset_config.get("pin_memory", False),
-        }
-        train_loader = get_mnist_dataloader(**mnist_cfg, train=True)
-        val_loader = get_mnist_dataloader(**mnist_cfg, train=False)
+        cfg = _filter_config(dataset_config, get_mnist_dataloader)
+        train_loader = get_mnist_dataloader(**cfg, train=True)
+        val_loader = get_mnist_dataloader(**cfg, train=False)
         return train_loader, val_loader
 
     elif dataset_name == "cifar100":
-        cifar100_cfg = {
-            "batch_size": dataset_config.get("batch_size", 128),
-            "data_dir": dataset_config.get("data_dir", "./data"),
-            "num_workers": dataset_config.get("num_workers", 0),
-            "pin_memory": dataset_config.get("pin_memory", False),
-        }
-        train_loader = get_cifar100_dataloader(**cifar100_cfg, train=True)
-        val_loader = get_cifar100_dataloader(**cifar100_cfg, train=False)
+        # CIFAR names its path argument ``root``; alias ``data_dir`` → ``root``.
+        cfg = _filter_config(dataset_config, get_cifar100_dataloader, aliases={"data_dir": "root"})
+        # NOTE: get_dataloader keeps CIFAR in RAW mode here (matches prior
+        # behaviour). The function itself supports latent mode — call it
+        # directly with vae/tokenizer/text_encoder to enable VAE latents.
+        if vae is not None and tokenizer is not None and text_encoder is not None:
+            _inject_latent_kwargs(cfg, dataset_config, vae, tokenizer, text_encoder)
+        train_loader = get_cifar100_dataloader(**cfg, train=True)
+        val_loader = get_cifar100_dataloader(**cfg, train=False)
         return train_loader, val_loader
 
     # ── COCO 2017 (validation split only, ModelScope) ─────────────────
-    elif dataset_name_lower in ("coco2017", "coco_2017"):
-        coco_cfg = {
-            "batch_size": dataset_config.get("batch_size", 32),
-            "data_dir": dataset_config.get("data_dir", None),
-            "cache_dir": dataset_config.get("cache_dir", None),
-            "image_size": dataset_config.get("image_size", 512),
-            "max_samples": dataset_config.get("max_samples", -1),
-            "num_workers": dataset_config.get("num_workers", 0),
-            "pin_memory": dataset_config.get("pin_memory", False),
-            "max_token_length": dataset_config.get("max_token_length", 77),
-        }
-        # Latent mode only when all three are provided (matches cifar/mqjh)
-        if vae is not None and tokenizer is not None and dataset_config.get("text_encoder") is not None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            dtype = _resolve_dtype(dataset_config.get("dtype", None), vae)
-            coco_cfg.update({
-                "vae": vae,
-                "tokenizer": tokenizer,
-                "text_encoder": dataset_config["text_encoder"],
-                "device": device,
-                "dtype": dtype,
-            })
-        train_loader = get_coco2017_dataloader(**coco_cfg, train=True)
-        val_loader = get_coco2017_dataloader(**coco_cfg, train=False)
+    elif dataset_name in ("coco2017", "coco2017val"):
+        cfg = _filter_config(dataset_config, get_coco2017_dataloader)
+        # Latent mode only when all three model components are provided.
+        if vae is not None and tokenizer is not None and text_encoder is not None:
+            _inject_latent_kwargs(cfg, dataset_config, vae, tokenizer, text_encoder)
+        train_flag = (dataset_name != "coco2017val")
+        train_loader = get_coco2017_dataloader(**cfg, train=train_flag)
+        val_loader = get_coco2017_dataloader(**cfg, train=False)
         return train_loader, val_loader
 
-    
-    elif dataset_name_lower in _T2I_DATASETS:
-        if vae is None or tokenizer is None:
-            raise ValueError(
-                f"T2I dataset '{dataset_name}' requires both vae and tokenizer. "
-                f"Got vae={vae}, tokenizer={tokenizer}"
-            )
+    # ── MJHQ-30K (latent + text embedding) ────────────────────────────
+    elif dataset_name in ("mjhq-30k", "mjhq30k", "MJHQ-30K", "MJHQ30K"):
+        # MJHQ names its path argument ``root``; alias ``data_dir`` → ``root``.
+        cfg = _filter_config(dataset_config, get_mqjh30k_dataloader, aliases={"data_dir": "root"})
+        if vae is not None and tokenizer is not None and text_encoder is not None:
+            _inject_latent_kwargs(cfg, dataset_config, vae, tokenizer, text_encoder)
+        train_loader = get_mqjh30k_dataloader(**cfg, train=True)
+        val_loader = get_mqjh30k_dataloader(**cfg, train=False)
+        return train_loader, val_loader
 
-        # Auto-detect device & dtype
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = _resolve_dtype(dataset_config.get("dtype", None), vae)
-
-        max_token_length = dataset_config.get("max_token_length", 77)
-        return load_t2i_data_tokenized(
-            dataset_name=dataset_name_lower,
-            vae=vae,
-            tokenizer=tokenizer,
-            device=device,
-            dtype=dtype,
-            batch_size=dataset_config.get("batch_size", 8),
-            max_samples=dataset_config.get("max_samples", 20000),
-            image_size=dataset_config.get("image_size", 256),
-            cc12m_path=dataset_config.get("cc12m_path", None),
-            val_samples=dataset_config.get("val_samples", 1000),
-            num_workers=dataset_config.get("num_workers", 0),
-            pin_memory=dataset_config.get("pin_memory", False),
-            drop_last=dataset_config.get("drop_last", True),
-            max_token_length=max_token_length,
+    else:
+        raise ValueError(
+            f"Unknown dataset '{dataset_name}'. "
+            f"Supported: mnist, cifar100, coco2017, mjhq-30k"
         )
 
-    raise ValueError(
-        f"Unknown dataset '{dataset_name}'. "
-        f"Supported: mnist, cifar100, coco2017, {', '.join(sorted(_T2I_DATASETS))}"
-    )
-
 
 # ---------------------------------------------------------------------------
-# Prompt-based calibration dataloader
+# Prompt-based dataloader
 # ---------------------------------------------------------------------------
-
 def get_dataset_prompts(
     dataset_name: str,
     dataset_path: str,
@@ -271,6 +220,65 @@ def get_dataloader_prompt(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _filter_config(dataset_config, fn, aliases=None, exclude=("dtype",)):
+    """Build keyword args for ``fn`` from ``dataset_config``.
+
+    Only keys that are **both** present in ``dataset_config`` and accepted by
+    ``fn`` (per its signature) are forwarded. Keys the caller omits are
+    deliberately NOT inserted, so ``fn``'s own parameter defaults take effect
+    — this dispatcher therefore holds no duplicated defaults; edit the target
+    ``get_xxx_dataloader`` to change a default.
+
+    Args:
+        dataset_config: Source config dict (read-only; not mutated).
+        fn: Target ``get_xxx_dataloader`` callable. Its signature decides
+            which keys are accepted (functions here have fixed signatures,
+            no ``**kwargs``).
+        aliases: Optional ``{config_key: fn_param_name}`` map for naming
+            mismatches, e.g. ``{"data_dir": "root"}`` when the dataset
+            function names the path argument ``root`` but the config uses
+            ``data_dir``.
+        exclude: Keys to skip even when present. ``"dtype"`` is excluded by
+            default because the config stores it as a string (e.g.
+            ``"bfloat16"``) whereas the functions expect a ``torch.dtype``;
+            it is resolved separately in :func:`_inject_latent_kwargs`.
+    """
+    aliases = aliases or {}
+    exclude = set(exclude)
+    accepted = {
+        name for name, p in inspect.signature(fn).parameters.items()
+        if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+    }
+    cfg = {}
+    for k, v in dataset_config.items():
+        if k in exclude or v is None:
+            continue
+        target = aliases.get(k, k)
+        if target in accepted:
+            cfg[target] = v
+    return cfg
+
+
+def _inject_latent_kwargs(cfg, dataset_config, vae, tokenizer, text_encoder):
+    """Add vae / tokenizer / text_encoder / device / dtype for latent mode.
+
+    Called only when all three model components are supplied. ``dtype`` is
+    resolved from a config string (e.g. ``"bfloat16"``) — or, when absent,
+    inherited from the VAE — into a real ``torch.dtype`` before injection,
+    so it never reaches the dataset function as a raw string.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = _resolve_dtype(dataset_config.get("dtype", None), vae)
+    cfg.update({
+        "vae": vae,
+        "tokenizer": tokenizer,
+        "text_encoder": text_encoder,
+        "device": device,
+        "dtype": dtype,
+    })
+    return cfg
+
+
 def _resolve_dtype(dtype_str: str | None, vae) -> torch.dtype:
     """Resolve compute dtype: explicit string → VAE param dtype → float16."""
     if dtype_str is not None:
@@ -285,36 +293,18 @@ def _resolve_dtype(dtype_str: str | None, vae) -> torch.dtype:
 
 
 # ---------------------------------------------------------------------------
-# Quick smoke test
+# 
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+
+    """
+    python -m src.data_loader
+    """
     
     import os
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-
-    os.makedirs("./outputs", exist_ok=True)
-
-    # ── Test 1: MNIST ──
-    """
-    print("=" * 60)
-    print("Test 1: MNIST via get_dataloader")
-    train_loader, val_loader = get_dataloader(
-        "MNIST",
-        {"batch_size": 64, "data_dir": "./data", "num_workers": 0},
-    )
-    x, y = next(iter(train_loader))
-    print(f"  Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
-    print(f"  Batch shape: x={tuple(x.shape)}, y={tuple(y.shape)}")
-    print(f"  x range: [{x.min().item():.4f}, {x.max().item():.4f}]")
-    print()
-    """
-
-    # ── Test 2: T2I with RandomVAE + RandomTokenizer ──
-    """
-    print("=" * 60)
-    print("Test 2: T2I (pokemon) via get_dataloader (dry-run VAE/tokenizer)")
 
     # Minimal stubs for testing without real models
     class _DummyVAE:
@@ -336,8 +326,43 @@ if __name__ == "__main__":
                 "attention_mask": torch.ones(bs, max_length, dtype=torch.long),
             }
 
+    class _DummyTextEncoder:
+        def __call__(self, text, max_length=77, padding="max_length",
+                     truncation=True, return_tensors="pt", **kwargs):
+            if isinstance(text, (list, tuple)):
+                bs = len(text)
+            else:
+                bs = 1
+            return {
+                "input_ids": torch.randint(0, 49408, (bs, max_length)),
+                "attention_mask": torch.ones(bs, max_length, dtype=torch.long),
+            }
+
     vae_dummy = _DummyVAE()
     tok_dummy = _DummyTokenizer()
+    text_encoder_dummy = _DummyTextEncoder()
+
+    os.makedirs("./outputs", exist_ok=True)
+
+    # ── Test 1: MNIST ──
+    """
+    print("=" * 60)
+    print("Test 1: MNIST via get_dataloader")
+    train_loader, val_loader = get_dataloader(
+        "MNIST",
+        {"batch_size": 64, "data_dir": "./data", "num_workers": 0},
+    )
+    x, y = next(iter(train_loader))
+    print(f"  Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    print(f"  Batch shape: x={tuple(x.shape)}, y={tuple(y.shape)}")
+    print(f"  x range: [{x.min().item():.4f}, {x.max().item():.4f}]")
+    print()
+    """
+
+    # ── Test 2: T2I with RandomVAE + RandomTokenizer ──
+    """
+    print("=" * 60)
+    print("Test 2:  pokemon via get_dataloader (dry-run VAE/tokenizer)")
 
     train_loader, val_loader = get_dataloader(
         "pokemon",
@@ -382,8 +407,15 @@ if __name__ == "__main__":
     print(f"  input_ids shape: {tuple(tokens['input_ids'].shape)}")
     print(f"  attention_mask shape: {tuple(tokens['attention_mask'].shape)}")
     print()
-
     """
+    # --- coco2017val ---
+    train_loader, val_loader = get_dataloader(
+        "coco2017val",
+        vae=vae_dummy,
+        tokenizer=tok_dummy,
+        text_encoder=text_encoder_dummy
+    )
+    data_batch = next(iter(val_loader))
 
     # Test prompt loading
     """

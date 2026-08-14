@@ -48,6 +48,7 @@ import math
 import os
 import gc
 import json
+import time
 from typing import Optional, List, Any
 from types import SimpleNamespace
 
@@ -228,15 +229,22 @@ class NVFP4Attention(nn.Module):
                                  use_nvfp4=use_nvfp4,
                                  rotation=rotation, permutation=permutation)
 
-        # QK norm (None for Sana Sprint 0.6B)
+        # QK norm. Sana_Sprint_0.6B uses "rms_norm_across_heads": the RMSNorm
+        # is applied over the full inner_dim (dim_head * heads) instead of
+        # per-head (dim_head). Matches diffusers ``Attention`` qk_norm handling.
+        from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
         self.norm_q = None
         self.norm_k = None
         if qk_norm == "layer_norm":
             self.norm_q = nn.LayerNorm(dim_head, eps=1e-5)
             self.norm_k = nn.LayerNorm(dim_head, eps=1e-5)
         elif qk_norm == "rms_norm":
-            self.norm_q = nn.RMSNorm(dim_head, eps=1e-5)
-            self.norm_k = nn.RMSNorm(dim_head, eps=1e-5)
+            self.norm_q = DiffusersRMSNorm(dim_head, eps=1e-5)
+            self.norm_k = DiffusersRMSNorm(dim_head, eps=1e-5)
+        elif qk_norm == "rms_norm_across_heads":
+            # Apply QK norm across ALL heads (full inner_dim = dim_head * heads).
+            self.norm_q = DiffusersRMSNorm(self.inner_dim, eps=1e-5)
+            self.norm_k = DiffusersRMSNorm(self.inner_dim, eps=1e-5)
 
         # Output projection
         self.to_out = nn.ModuleList([
@@ -840,7 +848,10 @@ class NVFP4QuantizedSana(nn.Module):
             rotation=self.rotation,
             permutation=self.permutation,
         )
-        self.caption_norm = nn.RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
+        # Use diffusers' RMSNorm (upcasts variance to float32) to match the
+        # reference SanaTransformer2DModel exactly under bfloat16.
+        from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
+        self.caption_norm = DiffusersRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
 
         # Transformer blocks
         self.transformer_blocks = nn.ModuleList([
@@ -879,7 +890,7 @@ class NVFP4QuantizedSana(nn.Module):
 
         self.gradient_checkpointing = False
         self.quantization_error_info: dict = {}
-        print(f"Initialize Sana Transformer {'Quantized' if use_nvfp4 else 'Unquantized'} mode, block_size={block_size}, "
+        print(f">> [Model] Initialize Sana Transformer {'Quantized' if use_nvfp4 else 'Unquantized'} mode, block_size={block_size}, "
               f"rotation={self.rotation}, permutation={self.permutation})")
 
     @property
@@ -904,7 +915,7 @@ class NVFP4QuantizedSana(nn.Module):
         if cache_dir:
             candidate = os.path.join(cache_dir, pretrained_model_name_or_path.replace("/", os.sep))
             if os.path.isdir(candidate):
-                print(f"Using local cache directory: {candidate}")
+                print(f">> [Model] Using local cache directory: {candidate}")
                 return candidate
 
         if download_source == "modelscope":
@@ -951,16 +962,13 @@ class NVFP4QuantizedSana(nn.Module):
                         use_nvfp4: bool = True,
                         rotation=None,
                         permutation=None,
-                        ref_model=None,
                         **kwargs):
-        """Build NVFP4QuantizedSana / unquantized Sana from a pretrained checkpoint.
+        """Build NVFP4QuantizedSana from a pretrained checkpoint.
 
         Args:
             ref_model: Optional pre-loaded SanaTransformer2DModel to copy weights
-                       from. If None, loads the reference model from disk.
+                       from. If None, loads weights directly from the checkpoint.
         """
-        from diffusers import SanaTransformer2DModel
-
         download_source = (download_source
                            or os.environ.get("DOWNLOAD_SOURCE", "modelscope").lower())
 
@@ -978,60 +986,99 @@ class NVFP4QuantizedSana(nn.Module):
             cfg = json.load(f)
 
         inner_dim = cfg.get("num_attention_heads", 0) * cfg.get("attention_head_dim", 0)
-        print(f"Config: layers={cfg.get('num_layers')}, "
+        print(f">> [Model] Config: layers={cfg.get('num_layers')}, "
               f"heads={cfg.get('num_attention_heads')}, "
               f"head_dim={cfg.get('attention_head_dim')}, "
               f"inner_dim={inner_dim}")
 
-        # Step 3: build model with config dimensions
-        model = cls(
-            sample_size=cfg.get("sample_size", 32),
-            patch_size=cfg.get("patch_size", 1),
-            in_channels=cfg.get("in_channels", 32),
-            out_channels=cfg.get("out_channels") or cfg.get("in_channels", 32),
-            num_layers=cfg["num_layers"],
-            attention_head_dim=cfg["attention_head_dim"],
-            num_attention_heads=cfg["num_attention_heads"],
-            num_cross_attention_heads=cfg.get("num_cross_attention_heads")
-                or cfg["num_attention_heads"],
-            cross_attention_head_dim=cfg.get("cross_attention_head_dim")
-                or cfg["attention_head_dim"],
-            cross_attention_dim=cfg.get("cross_attention_dim")
-                or inner_dim,
-            caption_channels=cfg.get("caption_channels", 2304),
-            mlp_ratio=cfg.get("mlp_ratio", 2.5),
-            attention_bias=cfg.get("attention_bias", True),
-            norm_elementwise_affine=cfg.get("norm_elementwise_affine", False),
-            norm_eps=cfg.get("norm_eps", 1e-6),
-            interpolation_scale=cfg.get("interpolation_scale", None),
-            guidance_embeds=cfg.get("guidance_embeds", True),
-            guidance_embeds_scale=cfg.get("guidance_embeds_scale", 0.1),
-            qk_norm=cfg.get("qk_norm", None),
-            block_size=block_size,
-            use_nvfp4=use_nvfp4,
-            rotation=rotation,
-            permutation=permutation,
-        )
+        # Step 3: build model
+        # Create on meta device: zero memory allocation.
+        # assign=True replaces meta tensors with checkpoint tensors.
+        # This avoids allocating the full model weights that are
+        # immediately discarded.
+        _t0 = time.time()
+        with torch.device('meta'):
+            model = cls(
+                sample_size=cfg.get("sample_size", 32),
+                patch_size=cfg.get("patch_size", 1),
+                in_channels=cfg.get("in_channels", 32),
+                out_channels=cfg.get("out_channels") or cfg.get("in_channels", 32),
+                num_layers=cfg["num_layers"],
+                attention_head_dim=cfg["attention_head_dim"],
+                num_attention_heads=cfg["num_attention_heads"],
+                num_cross_attention_heads=cfg.get("num_cross_attention_heads")
+                    or cfg["num_attention_heads"],
+                cross_attention_head_dim=cfg.get("cross_attention_head_dim")
+                    or cfg["attention_head_dim"],
+                cross_attention_dim=cfg.get("cross_attention_dim")
+                    or inner_dim,
+                caption_channels=cfg.get("caption_channels", 2304),
+                mlp_ratio=cfg.get("mlp_ratio", 2.5),
+                attention_bias=cfg.get("attention_bias", True),
+                norm_elementwise_affine=cfg.get("norm_elementwise_affine", False),
+                norm_eps=cfg.get("norm_eps", 1e-6),
+                interpolation_scale=cfg.get("interpolation_scale", None),
+                guidance_embeds=cfg.get("guidance_embeds", True),
+                guidance_embeds_scale=cfg.get("guidance_embeds_scale", 0.1),
+                qk_norm=cfg.get("qk_norm", None),
+                block_size=block_size,
+                use_nvfp4=use_nvfp4,
+                rotation=rotation,
+                permutation=permutation,
+            )
+            # print(f"  [timing] model creation (meta): {time.time() - _t0:.2f}s")
 
-        # Step 4: load reference model & copy weights
-        # Convert to target dtype BEFORE loading reference to halve peak memory.
+        # Step 4: load weights
+        # Load checkpoint directly. Our model is a structural replica of
+        # SanaTransformer2DModel so checkpoint keys match; only extra
+        # rotation/permutation buffers are absent (strict=False).
+        import glob
+        from safetensors.torch import load_file as load_safetensors
+
+        _t2 = time.time()
+        ckpt_dir = os.path.join(local_path, subfolder)
+        state_dict = {}
+        safetensors_files = sorted(glob.glob(os.path.join(ckpt_dir, "*.safetensors")))
+        if safetensors_files:
+            for f in safetensors_files:
+                state_dict.update(load_safetensors(f))
+        else:
+            bin_files = sorted(glob.glob(os.path.join(ckpt_dir, "*.bin")))
+            if not bin_files:
+                raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
+            for f in bin_files:
+                state_dict.update(torch.load(f, map_location="cpu"))
+        # print(f"  [timing] safetensors load: {time.time() - _t2:.2f}s")
+
+        _t3 = time.time()
+        # assign=True replaces meta tensors with loaded tensors (no copy).
+        # ~1000x faster than copy_() for large models.
+        missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+        # print(f"  [timing] load_state_dict: {time.time() - _t3:.2f}s")
+
+        real_missing = [k for k in missing if not any(s in k for s in ('_rotation', '_R_init', 'permutation'))]
+        if real_missing:
+            print(f"Warning: {len(real_missing)} missing keys, first 5: {real_missing[:5]}")
+        if unexpected:
+            print(f"Warning: {len(unexpected)} unexpected keys, first 5: {unexpected[:5]}")
+        # Check for remaining meta tensors (rotation/permutation buffers
+        # not present in checkpoint)
+        meta_params = [n for n, p in model.named_parameters() if p.is_meta]
+        meta_buffers = [n for n, b in model.named_buffers() if b.is_meta]
+        if meta_params or meta_buffers:
+            print(f"  [info] {len(meta_params) + len(meta_buffers)} meta tensors "
+                    f"remaining, materializing rotation/permutation...")
+            for module in model.modules():
+                if isinstance(module, NVFP4Linear):
+                    if module.rotation is not None and hasattr(module.rotation, 'fit'):
+                        module.rotation.fit()
+                    if module.permutation is not None and hasattr(module.permutation, 'fit'):
+                        module.permutation.fit(module.weight)
+        # Convert to target dtype (no-op if already matching)
         model = model.to(dtype=torch_dtype)
 
-        _should_del_ref = ref_model is None
-        if ref_model is None:
-            ref = SanaTransformer2DModel.from_pretrained(
-                local_path, subfolder=subfolder, local_files_only=True,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=True,
-            )
-        else:
-            ref = ref_model
-
-        model._copy_weights(ref)
-
-        if _should_del_ref:
-            del ref
-            gc.collect()
+        del state_dict
+        gc.collect()
 
         return model
 
@@ -1247,10 +1294,14 @@ class NVFP4QuantizedSana(nn.Module):
 
 
 # ===========================================================================
-# Smoke test
+# 
 # ===========================================================================
 
 if __name__ == "__main__":
+    
+    """
+    python -m src.models.nvfp4_quantized_Sana
+    """
 
     from diffusers.models.transformers.sana_transformer import SanaTransformer2DModel
     
@@ -1259,7 +1310,7 @@ if __name__ == "__main__":
     width = 16
     height = 16
     n_txt = 32
-    caption_channels = 512
+    caption_channels = 2304     # Sana_Sprint_0.6B caption dim
     # dtype = torch.float32
     dtype = torch.bfloat16
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1274,57 +1325,83 @@ if __name__ == "__main__":
     num_attention_heads = 4
     attention_head_dim = inner_dim // num_attention_heads
     
-    model_ori = SanaTransformer2DModel(
-        sample_size=16,
-        patch_size=1,
-        in_channels=in_channels,
-        out_channels=in_channels,
-        num_layers=2,
-        attention_head_dim=attention_head_dim,
-        num_attention_heads=num_attention_heads,
-        num_cross_attention_heads=num_attention_heads,
-        cross_attention_head_dim=attention_head_dim,
-        cross_attention_dim=inner_dim,
-        caption_channels=caption_channels,
-        mlp_ratio=2.0,
-        guidance_embeds=True,
+    # model_ori = SanaTransformer2DModel(
+    #     sample_size=16,
+    #     patch_size=1,
+    #     in_channels=in_channels,
+    #     out_channels=in_channels,
+    #     num_layers=2,
+    #     attention_head_dim=attention_head_dim,
+    #     num_attention_heads=num_attention_heads,
+    #     num_cross_attention_heads=num_attention_heads,
+    #     cross_attention_head_dim=attention_head_dim,
+    #     cross_attention_dim=inner_dim,
+    #     caption_channels=caption_channels,
+    #     mlp_ratio=2.0,
+    #     guidance_embeds=True,
+    # ).to(device, dtype=dtype)
+    model_ori = SanaTransformer2DModel.from_pretrained(
+        "G://models/Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+        subfolder="transformer",
+        cache_dir="G://models",
+        local_files_only=True,
+        torch_dtype=dtype
     ).to(device, dtype=dtype)
+    cur = time.time()
     y_ori = model_ori(hidden_states, encoder_hidden_states, timestep_embs, guidance=guidance, return_dict=True).sample
-    # print(f"Original model output shape: {y_ori.shape}")
+    print(f"Original model output shape: {y_ori.shape}")
+    print(f"Origin model loading+forward time: {time.time() - cur:.4f} seconds")
+
+    # Free origin model to save memory for NVFP4 model
+    del model_ori
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # rots = ["identity", "random", "hadamard", "cayley"]
     # perms = ["identity", "random", "mag"]
-    # rots = [None]
-    # perms = [None]
-    rots = [None, "identity"]
-    perms = [None, "identity"]
+    rots = ["identity"]
+    perms = ["identity"]
+    # rots = [None, "identity"]
+    # perms = [None, "identity"]
     for rot in rots:
         for perm in perms:
             for quantize in [False]: 
-                model_rpq = NVFP4QuantizedSana(
-                    sample_size=16,
-                    patch_size=1,
-                    in_channels=in_channels,
-                    out_channels=in_channels,
-                    num_layers=2,
-                    attention_head_dim=attention_head_dim,
-                    num_attention_heads=num_attention_heads,
-                    num_cross_attention_heads=num_attention_heads,
-                    cross_attention_head_dim=attention_head_dim,
-                    cross_attention_dim=inner_dim,
-                    caption_channels=caption_channels,
-                    mlp_ratio=2.0,
-                    attention_bias=False,
+                # model_rpq = NVFP4QuantizedSana(
+                #     sample_size=16,
+                #     patch_size=1,
+                #     in_channels=in_channels,
+                #     out_channels=in_channels,
+                #     num_layers=2,
+                #     attention_head_dim=attention_head_dim,
+                #     num_attention_heads=num_attention_heads,
+                #     num_cross_attention_heads=num_attention_heads,
+                #     cross_attention_head_dim=attention_head_dim,
+                #     cross_attention_dim=inner_dim,
+                #     caption_channels=caption_channels,
+                #     mlp_ratio=2.0,
+                #     attention_bias=False,
+                #     use_nvfp4=quantize,
+                #     rotation=rot,
+                #     permutation=perm
+                # ).to(device, dtype=dtype)
+                # model_rpq.load_state_dict(model_ori.state_dict())
+                cur = time.time()
+                model_rpq = NVFP4QuantizedSana.from_pretrained(
+                    "G://models/Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+                    cache_dir="G://models",
+                    local_files_only=True,
+                    torch_dtype=dtype,
                     use_nvfp4=quantize,
                     rotation=rot,
-                    permutation=perm,
-                    # rotation="identity",
-                    # permutation="identity",
-                    # rotation=None,
-                    # permutation=None,
+                    permutation=perm
                 ).to(device, dtype=dtype)
-                model_rpq.load_state_dict(model_ori.state_dict())
+                print(f"rpq model loading time: {time.time() - cur:.4f}")
                 y_rpq = model_rpq(hidden_states, encoder_hidden_states, timestep_embs, guidance=guidance, return_dict=True).sample
-                # print(f"Quantized model output shape: {y_rpq.shape}")
-                
+
                 diff = torch.mean(torch.abs(y_rpq - y_ori))
-                print(f"[{rot}-{perm}-{quantize}] MSE between original and quantized model: {diff}")
+                print(f"[{rot}-{perm}-{quantize}] MAE between original and quantized model: {diff:.6e}")
+                del model_rpq
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()

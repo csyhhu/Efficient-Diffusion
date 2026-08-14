@@ -80,7 +80,7 @@ python -m eval.generate_for_eval `
     --quantized --rotation hadamard --permutation identity `
     --dataset_name coco2017val `
     --dataset_path G://datasets//coco2017val `
-    --save_root G://Outputs//Efficient-Diffusion//eval_gen/sana-coco2017val-hadamard-identity
+    --save_root G://Outputs//Efficient-Diffusion//eval_gen/SD3-coco2017val-hadamard-identity
 ```
 For `cayley` rotation:
 ```bash
@@ -90,7 +90,7 @@ python -m eval.generate_for_eval `
     --quantized  --rotation cayley `
     --dataset_name coco2017val `
     --dataset_path G://datasets//coco2017val `
-    --save_root G://Outputs//Efficient-Diffusion//eval_gen/sana-coco2017val-cayley
+    --save_root G://Outputs//Efficient-Diffusion//eval_gen/SD3-coco2017val-cayley
 ```
 
 ## FID
@@ -107,8 +107,8 @@ python -m eval.main --fid --dataset_name coco2017 `
 Calculate generated images' FID stats.
 ```bash
 python -m eval.main --fid `
-    --input_dir G://Outputs//Efficient-Diffusion//eval_gen/sana-coco2017val-hadamard-identity `
-    --output_dir G://Outputs//Efficient-Diffusion//eval_gen/sana-coco2017val-hadamard-identity `  
+    --input_dir G://Outputs//Efficient-Diffusion//eval_gen/SD3-coco2017val-hadamard-identity `
+    --output_dir G://Outputs//Efficient-Diffusion//eval_gen/SD3-coco2017val-hadamard-identity `
     --dataset_name coco2017 `
     --fid_ref_stats G://datasets/coco2017_fid_stats.npz
 ```

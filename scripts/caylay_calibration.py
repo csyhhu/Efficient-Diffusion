@@ -1,15 +1,36 @@
 """
 A script to perform Cayley calibration on different ranges.
+
+python -m scripts.caylay_calibration `
+    --model_id stabilityai/stable-diffusion-3.5-medium `
+    --calib_dataset_name MJHQ-30K --calib_dataset_path G://datasets/MJHQ-30K --calib_n_sample 16 --cayley_iters 20`
+    --cayley_method module-wise`
+    --output_dir G://Outputs//Efficient-Diffusion//SD3-MJHQ//module-wise`
+
+python -m scripts.caylay_calibration `
+    --model_id Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers `
+    --calib_dataset_name cifar100 --calib_n_sample 2 --cayley_iters 20 `
+    --cayley_method module-wise --num_steps 2 `
+    --output_dir G://Outputs//Efficient-Diffusion//Caylay-Sana-cifar100//module-wise
+
+python -m scripts.caylay_calibration `
+    --model_id dit_cifar100_fm `
+    --calib_dataset_name cifar100 --calib_n_sample 128 --cayley_iters 100 `
+    --cayley_method module-wise --num_steps 4 `
+    --output_dir G://Outputs//Efficient-Diffusion//Caylay-DiT-cifar100//module-wise
 """
 
 import os
 import sys
 import argparse
+
+# Reduce CUDA memory fragmentation (helps with Cayley rotation backward graph)
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 from PIL import Image
 
-# sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.image_generation import ImageGeneration
+from src.image_generator import BaseImageGenerator, SanaImageGenerator, SD3ImageGenerator
 from src.data_loader import get_dataloader_prompt
 from src.utils import save_sample_grid, save_pil_grid
 
@@ -20,7 +41,7 @@ if __name__ == "__main__":
     parser.add_argument("--config_path", type=str, default="config/cifar100_dit_fm")
     parser.add_argument("--cache_dir", type=str, default="G://models")
     parser.add_argument("--calib_dataset_name", type=str, default="MJHQ-30K", help="Name of the dataset to use for calibration")
-    parser.add_argument("--calib_dataset_path", type=str, default="G://datasets/MJHQ-30K", help="Path to dataset directory with .txt caption files")
+    parser.add_argument("--calib_dataset_path", type=str, default=None, help="Path to dataset directory with .txt caption files")
     parser.add_argument("--calib_n_sample", type=int, default=8, help="Number of prompts to sample from dataset")
     parser.add_argument("--prompt", type=str, default="Astronaut in a jungle, cold color palette, muted colors, detailed, 8k", help="Single prompt for calibration (used if calib_dataset_path is not provided)")
     parser.add_argument("--seed", type=int, default=42)
@@ -31,32 +52,42 @@ if __name__ == "__main__":
     parser.add_argument("--cayley_batches", type=int, default=8)
     parser.add_argument("--cayley_iters", type=int, default=20)
     parser.add_argument("--cayley_lr", type=float, default=0.01)
+    parser.add_argument("--num_steps", type=int, default=4)
+    parser.add_argument("--single_step_mode", action="store_true", default=False)
+
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Existing model
-    gen = ImageGeneration(
+    if args.model_id == "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers":
+        Gen = SanaImageGenerator
+    elif args.model_id == "stabilityai/stable-diffusion-3.5-medium":
+        Gen = SD3ImageGenerator
+    else:
+        Gen = BaseImageGenerator
+        local_mode = True
+    gen = Gen(
         model_id=args.model_id,
         cache_dir=args.cache_dir,
         device=device,
         dtype=torch.bfloat16,
         use_nvfp4=True, block_size=args.block_size, 
-        rotation="cayley", permutation="identity"
+        rotation="cayley", permutation=None,
+        # use_origin_model=True,
+        local_mode=local_mode,
+        local_config_path=args.config_path
     )
+    
     error_info = gen.calibrate_cayley(
-        calibrate_dataset_name=args.calib_dataset_name,
-        # iters=args.cayley_iters,
-        # lr=args.cayley_lr,
-        iters=1,
-        lr=0,
-        criterion=args.cayley_method,
+        calibrate_dataset_name=args.calib_dataset_name, calib_dataset_path=args.calib_dataset_path, calib_n_sample=args.calib_n_sample,
+        criterion=args.cayley_method, iters=args.cayley_iters, lr=args.cayley_lr, 
+        num_steps=args.num_steps, single_step_mode=args.single_step_mode,
         save_path=args.output_dir,
-        test_mode=True
+        # test_mode=True
     )
     gen.plot_cayley_loss(error_info, save_root=args.output_dir)
-    gen.save_rotation(os.path.join(args.output_dir, "rotation_ckpt.pt"))
-    gen.generate(args.prompt, num_samples=4, visual_n_row=2, save_root=args.output_dir, save_name="cayley-test", seed=args.seed)
+    # gen.save_rotation(os.path.join(args.output_dir, "rotation_ckpt.pt"))
+    gen.generate(args.prompt, num_samples=4, visual_n_row=2, save_root=args.output_dir, save_name="cayley-test.png", seed=args.seed)
     # ---
     # Local Mode
     # ---

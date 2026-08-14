@@ -200,7 +200,7 @@ def make_rotation(rotation_type, in_features, seed=None):
     Returns:
         Callable: factory function (in_features) -> RotationBase
     """
-    if rotation_type is None or rotation_type in ["none"]:
+    if rotation_type is None or rotation_type in ["None", "none"]:
         return None
     if rotation_type in ["identity"]:
         return IdentityRotation(in_features)

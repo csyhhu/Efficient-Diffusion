@@ -45,12 +45,73 @@ class SanaImageGenerator(BaseImageGenerator):
     SANA_DEFAULT_MAX_TIMESTEPS = 1.5708
     SANA_DEFAULT_INTERMEDIATE_TIMESTEPS = 1.3
 
+    # CHI prompt prefix (same as SanaSprintPipeline.__call__ default)
+    _SANA_CHI = [
+        "Given a user prompt, generate an 'Enhanced prompt' that provides detailed visual descriptions suitable for image generation. Evaluate the level of detail in the user prompt:",
+        "- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, and spatial relationships to create vivid and concrete scenes.",
+        "- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating.",
+        "Here are examples of how to transform or refine prompts:",
+        "- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat curled up in a round shape, sleeping peacefully on a warm sunny windowsill, surrounded by pots of blooming red flowers.",
+        "- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street lamps, a diverse crowd of people in colorful clothing, and a double-decker bus passing by towering glass skyscrapers.",
+        "Please generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:",
+        "User Prompt: ",
+    ]
+
     def __init__(self, model_id=None, device="cuda", dtype=torch.bfloat16, **kwargs):
         if model_id is None:
             model_id = self.SANA_MODEL_ID
         kwargs.setdefault("device", device)
         kwargs.setdefault("dtype", dtype)
         super().__init__(model_id=model_id, **kwargs)
+
+    def encode_prompt(self, prompt, max_sequence_length=300, num_images_per_prompt=1,
+                      do_classifier_free_guidance=True, negative_prompt=None):
+        """Sana prompt encoding: Gemma + CHI prefix.
+
+        Mirrors ``SanaSprintPipeline._get_gemma_prompt_embeds`` exactly.
+        """
+        if getattr(self, "tokenizer", None) is not None:
+            self.tokenizer.padding_side = "right"
+
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        prompt = [p.strip() for p in prompt]
+
+        chi_prompt = "\n".join(self._SANA_CHI)
+        prompt = [chi_prompt + p for p in prompt]
+        num_chi_prompt_tokens = len(self.tokenizer.encode(chi_prompt))
+        max_length_all = num_chi_prompt_tokens + max_sequence_length - 2
+
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_length_all,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        prompt_attention_mask = text_inputs.attention_mask.to(self.device)
+
+        text_enc_out = self.text_encoder(
+            text_input_ids.to(self.device),
+            attention_mask=prompt_attention_mask,
+        )
+        prompt_embeds = text_enc_out[0].to(dtype=self.dtype, device=self.device)
+
+        max_length = max_sequence_length
+        select_index = [0] + list(range(-max_length + 1, 0))
+        prompt_embeds = prompt_embeds[:, select_index]
+        prompt_attention_mask = prompt_attention_mask[:, select_index]
+
+        bs_embed, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+        prompt_attention_mask = prompt_attention_mask.view(bs_embed, -1)
+        prompt_attention_mask = prompt_attention_mask.repeat(num_images_per_prompt, 1)
+
+        return prompt_embeds, prompt_attention_mask, None
+       
 
     def load_pipe(self):
         """Load SanaSprintPipeline and build custom transformer.
@@ -71,7 +132,7 @@ class SanaImageGenerator(BaseImageGenerator):
             local_files_only=True,
             low_cpu_mem_usage=True,
         )
-        print(f">> [{time.time() - cur_time:.2f}] Finish Pipeline Loading")
+        print(f">> [{time.time() - cur_time:.2f}] Pipeline Loading")
         # Reuse pipeline's transformer as reference for weight copy.
         cur_time = time.time()
         if self.use_origin_model:
@@ -95,9 +156,11 @@ class SanaImageGenerator(BaseImageGenerator):
             # del ref_transformer
             # Assign NVFP4 transformer to pipe and move everything to GPU
             pipe.transformer = self.transformer
-            print(f">> [{time.time() - cur_time:.2f}] Finish Custom Transformer Loading")
+            print(f">> [{time.time() - cur_time:.2f}] Custom Transformer Loading")
         
+        cur_time = time.time()
         self.pipe = pipe.to(self.device)
+        print(f">> [{time.time() - cur_time:.2f}] Pipe conversion to {self.device}")
         # Extract components
         self.tokenizer = pipe.tokenizer
         self.text_encoder = pipe.text_encoder
@@ -123,6 +186,17 @@ class SanaImageGenerator(BaseImageGenerator):
             torch_dtype=self.dtype,
         )
         return ref_model.to(self.device, dtype=self.dtype)
+
+    def _decode_latents_to_images(self, latents):
+        """Decode Sana latents: /sigma_data then /scaling_factor (VAE on CPU)."""
+        with torch.no_grad():
+            sigma_data = self.scheduler.config.sigma_data
+            scaling = self.vae.config.scaling_factor
+            vae_input = (latents.detach() / sigma_data / scaling).to(
+                "cpu", dtype=self.vae.dtype
+            )
+            images = self.vae.decode(vae_input, return_dict=False)[0]
+            return images.clamp(-1, 1).to(torch.float32)
 
     @torch.no_grad()
     def _custom_generate(
@@ -298,27 +372,38 @@ class SanaImageGenerator(BaseImageGenerator):
 
         return images
 
-    def compute_distillation_loss(self, ref_model, batch_data, criterion, num_steps,
-                                  loss_fn=F.mse_loss, single_step_mode=True, **kwargs):
-        """Compute distillation loss for Sana (SCM scheduler)."""
-        loss_acm_act = torch.tensor(0.0, device=self.device)
-        loss_acm_param = torch.tensor(0.0, device=self.device)
-        loss_acm_layer_wise = torch.tensor(0.0, device=self.device)
-        loss_acm_step_wise = torch.tensor(0.0, device=self.device)
-        error_info = {}
+    def compute_distillation_loss(self, ref_model, batch_data, criterion, num_steps, loss_fn=F.mse_loss, single_step_mode=False, test_mode=False, **kwargs):
+        """Compute distillation loss for Sana with a full SCM decode loop.
 
+        No hooks — all losses come from NVFP4Linear's exposed intermediates.
+        Noise is **randomly sampled** each call (not fixed) to enable proper
+        diffusion training loss (``dit_loss``) computation.
+
+        For each decode step:
+          1. Sample noise fresh, mix x_t from clean_target and noise.
+          2. Run the quantized ``self.transformer`` on ``x_t`` (with grad).
+          3. Run the unquantized ``ref_model`` on the same input (no grad).
+          4. Per-NVFP4Linear: module-wise (act+param) + layer-wise (output diff).
+          5. step-wise: ``loss_fn(output_target, output_ref)``.
+          6. dit_loss: standard diffusion training loss (noise prediction MSE
+             after SCM correction) — represents "normal training with rotation".
+          7. scheduler.step to update latents.
+          8. Record raw per-step ``error_info[step_idx]``.
+
+        Returns ``(latents, step_error_info, total_loss)`` where
+        ``step_error_info`` is the raw per-step dict (not aggregated).
+        """
         hidden_states = batch_data.get('x')
         encoder_hidden_states = batch_data.get('encoder_hidden_states')
         encoder_attention_mask = batch_data.get('encoder_attention_mask', None)
+
+        sigma_data = self.scheduler.config.sigma_data
+        # Random noise each call — enables proper diffusion training loss.
         noise = torch.randn_like(hidden_states)
+        # Sana feeds the VAE input scaled by sigma_data.
+        clean_target = hidden_states * sigma_data
 
-        if single_step_mode:
-            sampled_step_idx = torch.randint(0, num_steps, (1,)).item()
-            steps_to_run = [sampled_step_idx]
-        else:
-            steps_to_run = range(num_steps)
-
-        # SCM scheduler setup
+        # ---- SCM scheduler setup ------------------------------------------------
         guidance_embeds_scale = getattr(
             getattr(self.transformer, 'config', None), "guidance_embeds_scale", 0.1
         )
@@ -334,61 +419,117 @@ class SanaImageGenerator(BaseImageGenerator):
             intermediate_timesteps=(1.3 if num_steps == 2 else None),
         )
         self.scheduler.set_begin_index(0)
-        scm_timesteps = self.scheduler.timesteps[:-1].to(self.device).type(self.dtype)
+        scm_boundary_timesteps = self.scheduler.timesteps.to(self.device).type(self.dtype)
+        scm_timesteps = scm_boundary_timesteps[:-1]
+
+        if single_step_mode:
+            sampled_step_idx = torch.randint(0, num_steps, (1,)).item()
+            steps_to_run = [sampled_step_idx]
+        else:
+            steps_to_run = list(range(num_steps))
+
+        # ---- Accumulators (float32 to avoid bf16 drift) -------------------------
+        loss_acm_act = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_acm_param = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_acm_layer_wise = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_acm_step_wise = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_acm_dit = torch.zeros((), device=self.device, dtype=torch.float32)
+        error_info = {}
+
+        # ---- Latent state for the decode loop -----------------------------------
+        if single_step_mode:
+            i0 = steps_to_run[0]
+            t0 = scm_boundary_timesteps[i0]
+            s0 = t0.expand(hidden_states.shape[0])
+            scm_t0 = (torch.sin(s0) / (torch.cos(s0) + torch.sin(s0))).to(self.dtype)
+            scale0 = torch.sqrt(scm_t0.view(-1, 1, 1, 1) ** 2 + (1 - scm_t0.view(-1, 1, 1, 1)) ** 2)
+            x_t_target = (scale0 * clean_target + (1 - scale0) * noise).to(self.dtype)
+            x_t_ref = x_t_target.detach().clone()
+        else:
+            t_start = scm_boundary_timesteps[0]
+            s_start = t_start.expand(hidden_states.shape[0])
+            scm_t_start = (torch.sin(s_start) / (torch.cos(s_start) + torch.sin(s_start))).to(self.dtype)
+            scale_start = torch.sqrt(scm_t_start.view(-1, 1, 1, 1) ** 2 + (1 - scm_t_start.view(-1, 1, 1, 1)) ** 2)
+            x_t_target = (scale_start * clean_target + (1 - scale_start) * noise).to(self.dtype)
+            x_t_ref = x_t_target.detach().clone()
 
         for i in steps_to_run:
-            step_wise_module_loss_dict = {}
-            step_wise_layer_loss_dict = {}
+            step_module_loss_dict = {}
+            step_layer_loss_dict = {}
 
             t = scm_timesteps[i]
             timestep = t.expand(hidden_states.shape[0])
-            scm_t = torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))
-            scm_t = scm_t.to(self.dtype)
-            scm_t_expanded = scm_t.view(-1, 1, 1, 1)
+            scm_t = (torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))).to(self.dtype)
 
-            scale = torch.sqrt(scm_t_expanded**2 + (1 - scm_t_expanded)**2)
-            x_t = scale * hidden_states + (1 - scale) * noise
-
-            model_input_target = x_t.to(self.dtype)
-            model_input_ref = x_t.detach().to(self.dtype)
-
-            output_target = self.transformer(
-                hidden_states=model_input_target,
+            # --- Transformer forward (quantized target, with grad) --------------
+            common_kwargs = dict(
+                hidden_states=x_t_target,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
                 timestep=scm_t, guidance=guidance, return_dict=False,
-            )[0]
-            with torch.no_grad():
-                output_ref = ref_model(
-                    hidden_states=model_input_ref,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                    timestep=scm_t, guidance=guidance, return_dict=False,
-                )[0]
+            )
+            output_target = self.transformer(**common_kwargs)[0]
 
+            # --- Reference transformer forward (no grad) -------------------------
+            if not test_mode:
+                with torch.no_grad():
+                    ref_kwargs = dict(common_kwargs)
+                    ref_kwargs["hidden_states"] = x_t_ref
+                    output_ref = ref_model(**ref_kwargs)[0]
+
+            # --- Per-NVFP4Linear losses (no hooks — uses stored intermediates) ---
             for name, module in self.transformer.named_modules():
                 if isinstance(module, NVFP4Linear):
+                    # module-wise: quantization error on activation + weight
                     loss_act, loss_param = module.get_differentiable_quantization_error(loss_fn)
-                    step_wise_module_loss_dict[name] = {"act": loss_act.item(), "param": loss_param.item()}
-                    loss_acm_act += loss_act
-                    loss_acm_param += loss_param
-                    loss_layer_wise = loss_fn(output_ref.detach(), output_target)
-                    step_wise_layer_loss_dict[name] = loss_layer_wise.item()
-                    loss_acm_layer_wise += loss_layer_wise
+                    step_module_loss_dict[name] = {
+                        "act": float(loss_act.item()),
+                        "param": float(loss_param.item()),
+                    }
+                    loss_acm_act = loss_acm_act + loss_act.to(torch.float32)
+                    loss_acm_param = loss_acm_param + loss_param.to(torch.float32)
 
-            loss_step_wise = loss_fn(output_target, output_ref)
-            loss_acm_step_wise += loss_step_wise
+                    # layer-wise: this NVFP4Linear's output diff
+                    # (quantized output vs reference model's same module output).
+                    if not test_mode:
+                        output_ref_mod = ref_model.get_submodule(name).output
+                        loss_layer_wise = loss_fn(output_ref_mod.detach(), module.output)
+                        step_layer_loss_dict[name] = float(loss_layer_wise.item())
+                        loss_acm_layer_wise = loss_acm_layer_wise + loss_layer_wise.to(torch.float32)
 
+            # --- step-wise: DiT final output diff (target vs ref) ----------------
+            if not test_mode:
+                loss_step_wise = loss_fn(output_target, output_ref)
+                loss_acm_step_wise = loss_acm_step_wise + loss_step_wise.to(torch.float32)
+            else:
+                loss_step_wise = torch.zeros((), device=self.device, dtype=torch.float32)
+                loss_acm_step_wise = loss_acm_step_wise + loss_step_wise.to(torch.float32)
+
+            # --- dit_loss: standard diffusion training loss ---------------------
+            # For SCM: apply noise prediction correction to model output, then
+            # compare against the true noise. This is the "normal training"
+            # loss that would be used to train the DiT model.
+            scm_t_exp = scm_t.view(-1, 1, 1, 1)
+            den_norm_factor = torch.sqrt(scm_t_exp**2 + (1 - scm_t_exp) ** 2)
+            noise_pred_t = (
+                (1 - 2 * scm_t_exp) * x_t_target
+                + (1 - 2 * scm_t_exp + 2 * scm_t_exp**2) * output_target
+            ) / den_norm_factor
+            noise_pred_t = noise_pred_t.float() * sigma_data
+            dit_loss = loss_fn(noise_pred_t, noise.float())
+            loss_acm_dit = loss_acm_dit + dit_loss.to(torch.float32)
+
+            # --- Record raw per-step error_info ---------------------------------
             error_info[0 if single_step_mode else i] = {
-                "module_loss": step_wise_module_loss_dict,
-                "layer_loss": step_wise_layer_loss_dict,
-                "step_loss": loss_step_wise.item(),
+                "module_loss": step_module_loss_dict,
+                "layer_loss": step_layer_loss_dict,
+                "step_loss": float(loss_step_wise.item()),
+                "dit_loss": float(dit_loss.item()),
             }
 
-        final_loss = loss_step_wise
-        error_info['final'] = final_loss.item()
+        error_info["dit_loss_sum"] = float(loss_acm_dit.item())
 
-        return_dict = [hidden_states, error_info]
+        # ---- Select the *single* criterion for back-prop ------------------------
         if criterion == "module-wise":
             total_loss = loss_acm_act + loss_acm_param
         elif criterion == "layer-wise":
@@ -397,5 +538,25 @@ class SanaImageGenerator(BaseImageGenerator):
             total_loss = loss_acm_step_wise
         else:
             raise ValueError(f"Criterion type {criterion} is not supported.")
-        return_dict.append(total_loss)
-        return return_dict
+
+        if test_mode:
+            self.vae.eval()
+            x_t_target = denoised_target / self.scheduler.config.sigma_data
+            vae_input = (x_t_target / self.vae.config.scaling_factor).to(dtype=self.vae.dtype)
+            images = self.vae.decode(vae_input, return_dict=False)[0]
+            images = images.clamp(-1, 1)
+        else:
+            images = None
+
+        return x_t_target, error_info, total_loss, images
+
+
+if __name__ == "__main__":
+
+    from utils import memory_check
+    gen = SanaImageGenerator(
+        rotation="cayley",
+        use_origin_model=False
+        # use_origin_model=True
+    )
+    memory_check()
