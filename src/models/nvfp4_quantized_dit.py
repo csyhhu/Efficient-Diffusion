@@ -575,6 +575,8 @@ class NVFP4DiT(nn.Module):
             rotation=rotation, permutation=permutation,
             quantize=use_nvfp4)
 
+        self.classifier = nn.Linear(hidden_dim, 100)
+
         # Init weights
         nn.init.xavier_uniform_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
@@ -582,9 +584,11 @@ class NVFP4DiT(nn.Module):
         self._init_weights()
 
         self.quantization_error_info = {}
+
+        # self.n_parameters = self.cal_parameter_number()
        
-        print(f">> [Model] Initialize DiT Transformer {'Quantized' if use_nvfp4 else 'Unquantized'} mode, block_size={block_size}, "
-              f"rotation={rotation}, permutation={permutation}")
+        print(f">> [Model] Initialize DiT Transformer {'[Quantized]' if use_nvfp4 else '[Unquantized]'} mode, block_size=[{block_size}], "
+              f"rotation=[{rotation}], permutation=[{permutation}]")
 
     def _init_weights(self):
         # Xavier init for final proj
@@ -662,11 +666,22 @@ class NVFP4DiT(nn.Module):
 
         # Output projection
         tokens = self.final_norm(tokens)
+        # Classifier
+        logits = self.classifier(torch.mean(tokens.detach(), axis=1))
+        # Projection to patches for visualization
         patches = self.proj(tokens, quantization_error_info)  # (B, N, patch_dim)
 
         # Unpatchify back to image
         out = self.unpatchify(patches, H, W)              # (B, C, H, W)
-        return out
+        return out, logits
+
+
+    def get_grad_norm(self):
+        total_norm = 0.0
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                total_norm += param.grad.norm().item() ** 2
+        return total_norm ** 0.5
 
 
 # ===========================================================================
@@ -675,9 +690,12 @@ class NVFP4DiT(nn.Module):
 
 if __name__ == "__main__":
 
-    import os, sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from dit import DiT
+    # import os, sys
+    # sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    """
+    python -m src.models.nvfp4_quantized_dit
+    """
+    # from src.models.dit import DiT
     
     bs = 2
     in_channels = 32
@@ -699,6 +717,7 @@ if __name__ == "__main__":
     attention_head_dim = inner_dim // num_attention_heads
     
     # Test rotation / permutation consistency
+    """
     model_ori = DiT(
         in_channels=in_channels,
         image_size=height,
@@ -710,7 +729,8 @@ if __name__ == "__main__":
         cross_attention_dim=caption_channels
     ).to(device, dtype=dtype)
     y_ori = model_ori(hidden_states, timestep_embs, encoder_hidden_states=encoder_hidden_states)
-    # print(f"Original model output shape: {y_ori.shape}")
+    # print(f"Original model output shape: {y_ori.shape}, logits shape: {logits_ori.shape}")
+    """
     """
     rots = [None, "identity", "hadamard", "cayley"]
     perms = [None, "identity"]
@@ -772,15 +792,10 @@ if __name__ == "__main__":
         rotation="cayley",
         permutation="identity",
     ).to(device, dtype=dtype)
-    y_rpq = model_rpq(hidden_states, timestep_embs, encoder_hidden_states=encoder_hidden_states)
+    y_rpq, logits_rpq = model_rpq(hidden_states, timestep_embs, encoder_hidden_states=encoder_hidden_states)
+    print(f"Quantized model output shape: {y_rpq.shape}, logits shape: {logits_rpq.shape}")
     # for name, param in model_rpq.named_parameters():
     #     print(f"{name:<20s}: {param.shape}")
     # """
-    # Test how to retrieve all NVFP4Linear
-    for name, module in model_rpq.named_modules():
-        if isinstance(module, NVFP4Linear):
-            print(f"{name:<40s}: {module.x_eff.shape}, {module.W_eff.shape}, {module.output.shape}")
-        else:
-            print(f"{name:<40s}: {module}")
             
             

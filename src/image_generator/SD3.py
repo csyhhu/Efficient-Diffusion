@@ -227,6 +227,7 @@ class SD3ImageGenerator(BaseImageGenerator):
         seed=42,
         num_steps=None,
         return_intermediates=False,
+        return_computation_diff=False,
         **kwargs,
     ):
         """Custom generation mirroring StableDiffusion3Pipeline.__call__.
@@ -243,8 +244,11 @@ class SD3ImageGenerator(BaseImageGenerator):
         # Steps at which DiT runs; None means all steps. Other steps reuse
         # the most recent DiT noise_pred (skipping the forward).
         dit_inference_steps = kwargs.get("dit_inference_steps", None)
-        # if dit_inference_steps is not None:
-        #     dit_inference_steps = [int(x) for x in dit_inference_steps.split(",")]
+        if dit_inference_steps is not None:
+            if isinstance(dit_inference_steps, str):
+                dit_inference_steps = [int(x) for x in dit_inference_steps.split(",")]
+            print(f"dit_inference_steps: {dit_inference_steps}")
+        skip_plan = kwargs.get("skip_plan", None)
 
         do_cfg = guidance_scale > 1.0
         device = self.device
@@ -324,6 +328,8 @@ class SD3ImageGenerator(BaseImageGenerator):
                 "noise_preds": [],
                 "scheduler_outputs": [],
             }
+        if return_computation_diff:
+            step_wise_computation_diff = {}
 
         last_dit_output = None
         last_noise_pred = None
@@ -342,8 +348,15 @@ class SD3ImageGenerator(BaseImageGenerator):
                     encoder_hidden_states=prompt_embeds.to(dtype=self.dtype),
                     pooled_projections=pooled_prompt_embeds.to(dtype=self.dtype),
                     return_dict=False,
+                    return_computation_diff=return_computation_diff,
+                    skip_plan=skip_plan.get(str(i), None) if isinstance(skip_plan, dict) else skip_plan,
                 )[0]
-                last_dit_output = dit_output
+                if return_computation_diff:
+                    dit_output, computation_diff = dit_output
+                    last_dit_output = dit_output
+                    step_wise_computation_diff[i] = computation_diff
+                else:
+                    last_dit_output = dit_output
 
                 # Classifier-free guidance
                 if do_cfg:
@@ -387,6 +400,9 @@ class SD3ImageGenerator(BaseImageGenerator):
             intermediates_recorder["final_output"] = images.detach().cpu()
             intermediates_recorder["num_steps"] = len(timesteps)
             return images, intermediates_recorder
+
+        if return_computation_diff:
+            return images, step_wise_computation_diff
 
         return images
 

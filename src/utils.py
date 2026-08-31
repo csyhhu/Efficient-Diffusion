@@ -264,3 +264,115 @@ def _find_or_download_component(repo_id, cache_dir, required_files):
     )
     print(f"Downloaded to: {local_path}")
     return local_path
+
+
+
+def _shutdown_loaders(gen):
+    """Tear down DataLoader worker processes and free GPU memory on interrupt.
+
+    Without this, ``num_workers>0`` + ``persistent_workers=true`` leaves orphan
+    worker subprocesses alive after Ctrl+C on Windows (spawn start method).
+    """
+    for attr in ("train_loader", "val_loader"):
+        loader = getattr(gen, attr, None)
+        if loader is None:
+            continue
+        # Send the shutdown sentinel so persistent workers exit cleanly.
+        try:
+            loader._shutdown_workers()
+        except Exception:
+            pass
+        # Join the pin-memory thread if it was started.
+        pin_thread = getattr(loader, "_pin_memory_thread", None)
+        if pin_thread is not None:
+            try:
+                pin_thread.join(timeout=2)
+            except Exception:
+                pass
+        setattr(gen, attr, None)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def compute_computation_diff(_before, _after, metric='L2', dim=[], eps=1e-8):
+    """
+    Compute the difference metric between two tensors, supporting relative L1/L2 and cosine similarity.
+
+    Args:
+        _before, _after: Tensors with the same shape.
+        metric: 'L1', 'L2', or 'cos'.
+        dim: Dimensions to reduce (i.e., average over). If None or empty, reduce all elements.
+        eps: Small constant to avoid division by zero.
+    Returns:
+        Difference scalar (or tensor with remaining dimensions, depending on 'dim').
+    """
+    if metric == 'L1':
+        # Relative L1: |a-b| / (|a| + |b| + eps)
+        diff_norm = torch.abs(_before - _after)
+        denominator = torch.abs(_before) + torch.abs(_after) + eps
+        _diff = diff_norm / denominator
+        _result = _diff.mean(dim=dim)
+    elif metric == 'L2':
+        # Relative L2: element-wise squared error normalized by squared magnitudes.
+        diff_sq = torch.pow(_before - _after, 2)
+        denom_sq = torch.pow(_before, 2) + torch.pow(_after, 2) + eps
+        # Element-wise relative L2 (normalize each element separately).
+        _diff = diff_sq / denom_sq
+        # Average over specified dimensions to get the result.
+        _result = _diff.mean(dim=dim)
+    elif metric == 'cos':
+        # Cosine similarity: compute similarity over the last dimension,
+        # then average over other specified dimensions.
+        # Expected shape of _before and _after: [..., feature_dim].
+        # Remove -1 from dim if present, as cosine similarity is already computed along dim=-1.
+        dim_clean = [d for d in dim if d != -1]
+        sim = torch.cosine_similarity(_before, _after, dim=-1, eps=eps)
+        # Note: 'sim' has one fewer dimension (the last feature dim is reduced).
+        # Map remaining dimensions accordingly.
+        if dim_clean:
+            _result = sim.mean(dim=dim_clean)
+        else:
+            # If no remaining dimensions, average all elements into a scalar.
+            _result = sim.mean()
+        _result = 1 - _result
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+    return _result
+    """
+    if metric == 'L2':
+        _diff = torch.pow(_before - _after, 2)
+    elif metric == 'L1':
+        _diff = torch.abs(_before - _after)
+    elif metric == 'cos':
+        if -1 in dim:
+            dim.remove(-1)
+        _diff = torch.cosine_similarity(_before, _after, eps=1e-8, dim=-1)
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+    # print(dim)
+    _result = _diff.mean(dim)
+    return _result
+    """
+
+
+if __name__ == "__main__":
+
+    """
+    python -m src.utils
+    """
+
+    import torch
+
+    bs = 10
+    n_seq = 16
+    n_head = 4
+    dim = 128
+    before = torch.rand([bs, n_seq, dim])
+    after = torch.rand([bs, n_seq, dim])
+
+    dist = compute_computation_diff(before, after, dim=[0, -1], metric='L2')
+    print(dist.shape)
+    dist = compute_computation_diff(before, after, dim=[0, -1], metric='L1')
+    print(dist.shape)
+    dist = compute_computation_diff(before, after, dim=[0, -1], metric='cos')
+    print(dist.shape)

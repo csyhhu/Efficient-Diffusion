@@ -41,6 +41,7 @@ from src.data.mqjh import get_mqjh30k_dataloader
 from src.data_loader import get_dataset_prompts, get_dataloader
 
 from src.utils import memory_check
+from src.recoder import Recorder
 
 
 def _plot_per_module_split(x_axis, per_module_data, all_names, save_dir,
@@ -116,10 +117,11 @@ class BaseImageGenerator:
         use_origin_model=False,
         download_source="modelscope",
         cache_dir="G://models",
+        output_dir=None,
         use_nvfp4=False,
         block_size=16,
-        rotation="identity",
-        permutation="identity",
+        rotation=None,
+        permutation=None,
         local_mode=False,
         local_config_path=None,
         load_origin_model=False,
@@ -146,6 +148,7 @@ class BaseImageGenerator:
         self.block_size = block_size
         self.download_source = download_source
         self.cache_dir = cache_dir
+        self.output_dir = output_dir
         self.local_mode = local_mode
         self.local_config_path = local_config_path
         self.device = torch.device(device) if isinstance(device, str) else device
@@ -178,6 +181,14 @@ class BaseImageGenerator:
         self.val_loader = None
         self.optimizer = None
         self.ema = None
+        self.recorder = None
+        self.start_epoch = 0
+        # Cached unconditional (empty-string) embedding for CFG dropout training.
+        # Computed once in prepare_local_training via encode_prompt("").
+        self._uncond_embeds = None
+
+        # For Analysis
+        self.step_wise_computation_diff = {}
 
         # Initialize components based on mode
         if self.local_mode:
@@ -245,7 +256,7 @@ class BaseImageGenerator:
     def build_local_pipeline(self):
         """Build the local DiT pipeline: scheduler, transformer, configs."""
         # Load local configs
-        config_dir = self.local_config_path or os.path.dirname(self.model_id) if self.model_id else "."
+        config_dir = self.local_config_path
         model_config_path = os.path.join(config_dir, "model.yaml")
         dataset_config_path = os.path.join(config_dir, "dataset.yaml")
         running_config_path = os.path.join(config_dir, "running.yaml")
@@ -393,17 +404,35 @@ class BaseImageGenerator:
     def prepare_local_training(self):
         """Prepare data loaders and optimizer for local training."""
         dataset_config = self._local_dataset_config
-        self.get_dataloader(dataset_name=dataset_config.get("dataset_name", "cifar100"))
+        self.train_loader, self.val_loader = get_dataloader(
+            dataset_name=dataset_config.get("dataset_name", "cifar100"),
+            dataset_config=dataset_config,
+            vae=self.vae, tokenizer=self.tokenizer, text_encoder=self.text_encoder
+        )
         print(f"[train] Train loader: {len(self.train_loader)} batches, {len(self.train_loader.dataset)} samples")
         print(f"[train] Val loader: {len(self.val_loader)} batches, {len(self.val_loader.dataset)} samples")
 
+        # Precompute the unconditional (empty-string) embedding once, so CFG
+        # dropout in train() can swap dropped samples with the SAME null token
+        # used at inference (encode_prompt("")). Shape: (seq, dim).
+        with torch.no_grad():
+            uncond, _, _ = self.encode_prompt(
+                "", num_images_per_prompt=1, do_classifier_free_guidance=False,
+            )
+            self._uncond_embeds = uncond[0].detach().to(self.device, dtype=self.dtype)
+
         running_config = self._local_running_config
+        self.output_dir = running_config.get("output_dir", "./outputs") if self.output_dir is None else self.output_dir
+
+        self.start_epoch = 0
         self.optimizer = torch.optim.Adam(
             self.transformer.parameters(),
-            lr=running_config.get("lr", 0.0001),
+            lr=running_config.get("lr", 1e-1),
             betas=(0.9, 0.999),
         )
         self.ema = EMAModel(self.transformer, decay=0.999)
+        self.recorder = Recorder(save_path=os.path.join(self.output_dir, "record.json"))
+        self.load_checkpoint("last_model.pth")
 
         mixed_precision = running_config.get("mixed_precision", None)
         if mixed_precision and torch.cuda.is_available():
@@ -418,27 +447,26 @@ class BaseImageGenerator:
             self.scaler = None
             self.autocast_dtype = None
 
-    def train(self, output_dir=None):
+    def train(self):
         """Train local DiT model."""
-        if output_dir is None:
-            output_dir = self._local_running_config.get("output_dir", "./outputs/cifar100_dit_fm")
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
 
         running_config = self._local_running_config
         epochs = running_config.get("epochs", 200)
-        sample_interval = running_config.get("sample_interval", 10)
         test_prompt = running_config.get("test_prompt", "A cat")
         num_steps = running_config.get("num_steps", 50)
-        record_interval = running_config.get("record_interval", 10)
+        sample_interval = running_config.get("sample_interval", 10)
+        save_interval = running_config.get("save_interval", 10)
+        record_interval = running_config.get("record_interval", 1)
 
-        loss_history = []
-        best_val_loss = float("inf")
-        global_step = 0
+        # CFG training: drop each sample's conditioning with prob cfg_dropout
+        # (replaced by the cached uncond embedding); guidance_scale is the
+        # inference CFG scale used for the periodic qualitative samples.
+        cfg_dropout = float(running_config.get("cfg_dropout", 0.0))
+        guidance_scale = float(running_config.get("guidance_scale", 1.0))
 
-        for epoch in range(epochs):
-            if (epoch + 1) % sample_interval == 0 or epoch == 0:
-                samples = self.generate(prompt=test_prompt, num_samples=4, num_steps=num_steps)
-                save_sample_grid(samples, os.path.join(output_dir, f"samples_epoch_{epoch+1}.png"), nrow=2)
+        global_step = self.start_epoch * len(self.train_loader)
+        for epoch in range(self.start_epoch, epochs):
 
             start_time = time.time()
             self.transformer.train()
@@ -446,12 +474,25 @@ class BaseImageGenerator:
             num_batches = 0
 
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-            for latents, encoder_hidden_states in pbar:
+            for latents, encoder_hidden_states, labels in pbar:
                 latents = latents.to(self.device, dtype=self.dtype, non_blocking=True)
                 encoder_hidden_states = encoder_hidden_states.to(self.device, dtype=self.dtype, non_blocking=True)
+                labels = labels.to(self.device, dtype=torch.float32, non_blocking=True)
+                batch_size = latents.shape[0]
 
                 self.optimizer.zero_grad()
-                batch_size = latents.shape[0]
+
+                # Classifier-free guidance dropout: per-sample, with prob
+                # cfg_dropout, swap the conditioning with the cached uncond
+                # embedding (empty-string BERT output). This trains the model
+                # to handle the unconditional branch used at inference.
+                if cfg_dropout > 0:
+                    drop = torch.rand(batch_size, device=self.device) < cfg_dropout
+                    if drop.any():
+                        uncond = self._uncond_embeds.to(encoder_hidden_states).expand_as(encoder_hidden_states)
+                        encoder_hidden_states = torch.where(
+                            drop.view(-1, 1, 1), uncond, encoder_hidden_states
+                        )
 
                 autocast_context = torch.autocast(device_type="cuda", dtype=self.autocast_dtype) if self.autocast_dtype else contextlib.nullcontext()
 
@@ -461,21 +502,30 @@ class BaseImageGenerator:
                         noise = torch.randn_like(latents)
                         x_t = (1 - t.view(-1, 1, 1, 1)) * latents + t.view(-1, 1, 1, 1) * noise
                         target = noise - latents
-                        model_output = self.transformer(x_t, t, encoder_hidden_states=encoder_hidden_states)
+                        model_output, logits = self.transformer(x_t, t, encoder_hidden_states=encoder_hidden_states)
                         loss = F.mse_loss(model_output, target)
                     else:
                         t = self.scheduler.sample_timesteps(batch_size, str(self.device))
                         noise = torch.randn_like(latents)
                         x_t, _ = self.scheduler.add_noise(latents, t, noise)
-                        model_output = self.transformer(x_t, t.float(), encoder_hidden_states=encoder_hidden_states)
+                        model_output, logits = self.transformer(x_t, t.float(), encoder_hidden_states=encoder_hidden_states)
                         loss = F.mse_loss(model_output, noise)
+                    if logits is not None:
+                        classifier_loss = F.cross_entropy(logits, labels)
+                    else:
+                        classifier_loss = None
+
 
                 if self.scaler is not None and self.scaler.is_enabled():
                     self.scaler.scale(loss).backward()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    loss.backward()
+                    if classifier_loss is not None:
+                        (loss + classifier_loss).backward()
+                    else:
+                        loss.backward()
+                    grad_norm = self.transformer.get_grad_norm()
                     self.optimizer.step()
 
                 self.ema.update()
@@ -483,100 +533,113 @@ class BaseImageGenerator:
                 num_batches += 1
                 global_step += 1
 
+                # Classifier Acc
+                if logits is not None:
+                    acc = (torch.argmax(logits, dim=1) == torch.argmax(labels, dim=1)).float().mean().item()
+                else:
+                    acc = 0.0
+
                 if (global_step + 1) % record_interval == 0:
                     current_loss = loss.detach().item()
-                    avg_loss = (total_loss / num_batches).item()
-                    loss_history.append({"epoch": epoch, "step": global_step, "loss": current_loss, "avg_loss": avg_loss})
-                    pbar.set_postfix({"loss": f"{current_loss:.3e}", "avg_loss": f"{avg_loss:.3e}"})
-
+                    self.recorder.update(
+                        {
+                            "loss": current_loss, 
+                            "acc": acc, 
+                            "grad_norm": grad_norm
+                        }, 
+                        global_step
+                    )
+                    pbar.set_postfix({"loss": f"{current_loss:.3e} | {acc:.3f}"})
+            
+            eval_loss, eval_acc = self.eval()
             avg_train_loss = total_loss / num_batches
-            avg_val_loss = self.eval()
+            if (epoch + 1) % sample_interval == 0 or epoch == 0:
+                self.recorder.update({"eval_loss": eval_loss, "eval_acc": eval_acc}, global_step)
+                samples = self.generate(
+                    prompt=test_prompt, num_samples=4, num_steps=num_steps,
+                    guidance_scale=guidance_scale, negative_prompt="",
+                )
+                save_sample_grid(samples, os.path.join(self.output_dir, f"samples_epoch_{epoch + 1}.png"), nrow=2)
+                torch.save(
+                        {
+                        "epoch": epoch,
+                        "model_state_dict": self.transformer.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict(),
+                        "ema_state_dict": self.ema.state_dict(),
+                        "loss": eval_loss,
+                        "acc": eval_acc,
+                    }, os.path.join(self.output_dir, "last_model.pth")
+                )
+                self.recorder.save()
 
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": self.transformer.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "ema_state_dict": self.ema.state_dict(),
-                    "loss": best_val_loss,
-                }, os.path.join(output_dir, "best_model.pth"))
-
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": self.transformer.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "ema_state_dict": self.ema.state_dict(),
-                "loss": avg_val_loss,
-            }, os.path.join(output_dir, "last_model.pth"))
-
-            with open(os.path.join(output_dir, "loss_history.json"), "w", encoding="utf-8") as f:
-                json.dump(loss_history, f, ensure_ascii=False, indent=2)
 
     def eval(self):
         """Evaluate the model on validation dataset."""
         self.transformer.eval()
-        val_loss = 0.0
-        val_batches = 0
+        eval_loss = 0.0
+        eval_correct = 0.0
+        eval_total = 0.0
 
-        with torch.no_grad():
-            for latents, encoder_hidden_states in self.val_loader:
-                latents = latents.to(self.device, dtype=self.dtype)
-                encoder_hidden_states = encoder_hidden_states.to(self.device, dtype=self.dtype)
-                batch_size = latents.shape[0]
-
+        pbar = tqdm(self.val_loader, desc=f"Evaluation")
+        for latents, encoder_hidden_states, labels in pbar:
+            latents = latents.to(self.device, dtype=self.dtype)
+            encoder_hidden_states = encoder_hidden_states.to(self.device, dtype=self.dtype)
+            labels = labels.to(self.device)
+            batch_size = latents.shape[0]
+            with torch.no_grad():
                 if isinstance(self.scheduler, FlowMatchingScheduler):
                     t = torch.rand(batch_size, device=self.device)
                     noise = torch.randn_like(latents)
                     x_t = (1 - t.view(-1, 1, 1, 1)) * latents + t.view(-1, 1, 1, 1) * noise
                     target = noise - latents
-                    model_output = self.transformer(x_t, t, encoder_hidden_states=encoder_hidden_states)
-                    loss = F.mse_loss(model_output, target)
+                    model_output, logits = self.transformer(x_t, t, encoder_hidden_states=encoder_hidden_states)
                 else:
                     t = self.scheduler.sample_timesteps(batch_size, str(self.device))
                     noise = torch.randn_like(latents)
                     x_t, _ = self.scheduler.add_noise(latents, t, noise)
-                    model_output = self.transformer(x_t, t.float(), encoder_hidden_states=encoder_hidden_states)
-                    loss = F.mse_loss(model_output, noise)
+                    model_output, logits = self.transformer(x_t, t.float(), encoder_hidden_states=encoder_hidden_states)
+                
+                eval_loss += F.mse_loss(logits, labels).detach().item()
+                eval_correct += (torch.argmax(logits, dim=1) == torch.argmax(labels, dim=1)).float().sum().item()
+                eval_total += batch_size
+                pbar.set_postfix({"loss": f"{eval_loss / eval_total:.3e}", "acc": f"{eval_correct / eval_total:.3f}"})
 
-                val_loss += loss.item()
-                val_batches += 1
+        return eval_loss / eval_total, eval_correct / eval_total
 
-        return val_loss / val_batches
 
-    def load_checkpoint(self, ckpt_path=None):
+    def load_checkpoint(self, post_fix=None):
         """Load a checkpoint for local DiT model."""
-        if ckpt_path is None:
-            output_dir = self._local_running_config.get("output_dir", "./outputs")
-            ckpt_path = os.path.join(output_dir, "best_model.pth")
-
-        print(f"Loading checkpoint from {ckpt_path}...")
-        if not os.path.exists(ckpt_path):
-            raise ValueError(f"Checkpoint file not found at {ckpt_path}")
-
-        checkpoint = torch.load(ckpt_path, map_location=self.device)
-        self.transformer = self.build_local_transformer()
-        self.transformer.load_state_dict(checkpoint["model_state_dict"])
-
-        if self.ema is None:
+        ckpt_path = os.path.join(self.output_dir, post_fix)
+        if os.path.exists(ckpt_path):
+            print(f"Loading checkpoint from {ckpt_path}...")
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            self.transformer.load_state_dict(checkpoint["model_state_dict"])
+            if "ema_state_dict" in checkpoint:
+                self.ema.load_state_dict(checkpoint["ema_state_dict"])
             self.ema = EMAModel(self.transformer, decay=0.999)
-        if "ema_state_dict" in checkpoint:
-            self.ema.load_state_dict(checkpoint["ema_state_dict"])
-
-        print(f"Checkpoint loaded (epoch={checkpoint.get('epoch', '?')}, loss={checkpoint.get('loss', '?')})")
+            if "optimizer_state_dict" in checkpoint:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self.start_epoch = checkpoint.get("epoch", 0) + 1
+            self.recorder.load()
+            print(f"Checkpoint loaded (epoch={self.start_epoch}, loss={checkpoint.get('loss', '?')})")
+        else:
+            print(f"No checkpoint found for [{ckpt_path}]. Starting from scratch.")
 
     # ==================================================================
     # Prompt encoding (generic local-DiT path)
     # Subclasses (SanaImageGenerator / SD3ImageGenerator) override this
     # with model-specific encoding logic.
     # ==================================================================
-
-    def encode_prompt(self, prompt, max_sequence_length=300, num_images_per_prompt=1,
-                      do_classifier_free_guidance=True, negative_prompt=None):
+    def encode_prompt(self, prompt, max_sequence_length=300, num_images_per_prompt=1, do_classifier_free_guidance=False, negative_prompt=None):
         """Encode prompt text into embeddings for local DiT mode (BERT).
 
         Generic single-tokenizer path used by ``dit_cifar100_fm`` etc.
         Subclasses override this for Sana (Gemma+CHI) and SD3 (dual-CLIP).
+
+        When ``do_classifier_free_guidance=True`` the negative prompt(s) are
+        encoded alongside the positive prompt(s) and prepended in batch order
+        ``[neg..., pos...]`` so a downstream ``chunk(2)`` yields
+        ``(uncond, cond)``.
 
         Returns:
             (prompt_embeds, prompt_attention_mask, pooled_prompt_embeds=None)
@@ -589,11 +652,23 @@ class BaseImageGenerator:
 
         if isinstance(prompt, str):
             prompt = [prompt]
-
         prompt = [p.lower().strip() for p in prompt]
 
+        # Classifier-free guidance: build [neg..., pos...] batch in one pass.
+        if do_classifier_free_guidance:
+            if negative_prompt is None:
+                negative_prompt = [""] * len(prompt)
+            elif isinstance(negative_prompt, str):
+                negative_prompt = [negative_prompt]
+            negative_prompt = [p.lower().strip() for p in negative_prompt]
+            if len(negative_prompt) < len(prompt):
+                negative_prompt = negative_prompt * len(prompt)
+            encode_list = list(negative_prompt) + list(prompt)
+        else:
+            encode_list = prompt
+
         text_inputs = self.tokenizer(
-            prompt,
+            encode_list,
             padding="max_length",
             max_length=max_length,
             truncation=True,
@@ -636,6 +711,7 @@ class BaseImageGenerator:
         save_root=None,
         save_name=None,
         return_intermediates=False,
+        return_computation_diff=False,
         **kwargs,
     ):
         """Generate images and optionally save to disk.
@@ -663,37 +739,34 @@ class BaseImageGenerator:
         """
         # ---- Dataset mode ----
         if dataset_name is not None:
-            n_generated_sample = kwargs.get("n_generated_sample", -1)
-            prompts = get_dataset_prompts(dataset_name, dataset_path, n_sample=n_generated_sample)
+            prompts = get_dataset_prompts(dataset_name, dataset_path, n_sample=num_samples)
             print(f"[Dataset mode] {len(prompts)} prompts from '{dataset_name}' -> {save_root}")
             # Forward all kwargs except the dataset-mode control arg.
-            forward_kwargs = {k: v for k, v in kwargs.items() if k != "n_generated_sample"}
+            # forward_kwargs = {k: v for k, v in kwargs.items() if k != "num_samples"}
             # When return_intermediates=True, collect per-prompt intermediates
             # (dit_outputs / noise_preds / scheduler_outputs / num_steps) and
             # return them to the caller for saving. Image saving still happens
             # inside _custom_generate via save_root / save_name.
             all_intermediates = [] if return_intermediates else None
+            # all_step_wise_computation_diff = [] if return_computation_diff else None
             for idx, p in enumerate(prompts):
                 result = self.generate(
                     prompt=p, num_samples=1, seed=seed,
                     num_steps=num_steps, used_origin_pipe=used_origin_pipe,
                     return_intermediates=return_intermediates,
+                    return_computation_diff=return_computation_diff,
                     save_root=save_root,
-                    # save_name=f"{p.replace('/', '_').replace('.', '_')}.png",
-                    save_name=f"{idx:05d}.png",
+                    save_name=f"{idx:05d}",
                     visual_n_row=1,
-                    **forward_kwargs,
+                    **kwargs,
                 )
                 if return_intermediates and result is not None:
                     _, inter = result
                     inter["prompt"] = p
                     inter["seed"] = seed
                     all_intermediates.append(inter)
-                if (idx + 1) % 10 == 0:
-                    print(f"  [{idx + 1}/{len(prompts)}] saved")
-
             if return_intermediates:
-                return None, all_intermediates
+                return all_intermediates
             return None
 
         # ---- Prompt mode ----
@@ -726,16 +799,27 @@ class BaseImageGenerator:
                 seed=seed,
                 num_steps=num_steps,
                 return_intermediates=return_intermediates,
+                return_computation_diff=return_computation_diff,
                 **kwargs,
             )
             if return_intermediates:
                 image, intermediates_recorder = result
+            elif return_computation_diff:
+                image, step_wise_computation_diff = result
+                save_postfix = kwargs.get('save_postfix', None)
+                if save_postfix is None:
+                    computation_diff_save_root = f"{save_root}/diff_dict"
+                else:
+                    computation_diff_save_root = f"{save_root}/diff_dict/{save_postfix}"
+                os.makedirs(computation_diff_save_root, exist_ok=True)
+                torch.save(step_wise_computation_diff, f"{computation_diff_save_root}/{save_name}.pt")
             else:
                 image = result
             if save_root is not None and save_name is not None:
-                print(f"  Saved -> {os.path.join(save_root, save_name)}")
+                save_name = f"{save_name}_{save_postfix}" if save_postfix is not None else save_name
+                print(f"  Saved -> {os.path.join(save_root, f"{save_name}.png")}")
                 os.makedirs(save_root, exist_ok=True)
-                save_sample_grid(image, os.path.join(save_root, save_name), nrow=visual_n_row)
+                # save_sample_grid(image, os.path.join(save_root, f"{save_name}.png"), nrow=visual_n_row)
 
         print(f">> [{time.time() - cur_time:.2f}] Finish Generation")
         return result
@@ -760,8 +844,12 @@ class BaseImageGenerator:
           ``20`` for FM and ``50`` for DDPM.
         - return_intermediates (bool): If ``True`` return
           ``(pil_images, intermediates_dict)`` instead of just images.
-        - guidance_scale (float): Not used by local DiT (single prompt), but
-          accepted for API compatibility with Sana/SD3 subclasses.
+        - guidance_scale (float): CFG scale. ``> 1.0`` enables classifier-free
+          guidance (encodes the negative prompt alongside the positive one and
+          mixes ``uncond + scale * (cond - uncond)`` each step). Default ``1.0``
+          disables CFG and reproduces the previous single-prompt behaviour.
+        - negative_prompt (str | None): Negative prompt for CFG. Defaults to
+          an empty string (true unconditional) when CFG is active.
         """
         # ---- Parse args (align with generate() signature for subclass parity) -
         prompt = kwargs.get("prompt", None)
@@ -769,6 +857,9 @@ class BaseImageGenerator:
         seed = kwargs.get("seed", None)
         num_steps = kwargs.get("num_steps", None)
         return_intermediates = bool(kwargs.get("return_intermediates", False))
+        guidance_scale = float(kwargs.get("guidance_scale", 1.0))
+        negative_prompt = kwargs.get("negative_prompt", None)
+        do_cfg = guidance_scale > 1.0
 
         # ---- Scheduler selection ----------------------------------------------
         is_fm = isinstance(self.scheduler, FlowMatchingScheduler)
@@ -800,13 +891,20 @@ class BaseImageGenerator:
         # ---- Prompt encoding ---------------------------------------------------
         # ``encode_prompt`` is overridden by SanaImageGenerator / SD3ImageGenerator
         # but base version works for single-tokenizer local DiT (BERT / CIFAR).
+        # When CFG is on, encode_prompt returns batch [neg, pos]; we expand each
+        # to num_samples via repeat_interleave -> [neg*n, pos*n] so that
+        # torch.cat([latents]*2) pairs uncond/cond correctly for chunk(2).
         prompt_embeds, prompt_attention_mask, _pooled = self.encode_prompt(
             prompt or "a photo",
             num_images_per_prompt=1,
+            do_classifier_free_guidance=do_cfg,
+            negative_prompt=negative_prompt,
         )
-        # encode_prompt returns batch = len(prompt_list). Repeat or truncate to
-        # match num_samples so that batched transformer forward works.
-        if prompt_embeds.shape[0] != num_samples:
+        if do_cfg:
+            prompt_embeds = prompt_embeds.repeat_interleave(num_samples, dim=0)
+            if prompt_attention_mask is not None:
+                prompt_attention_mask = prompt_attention_mask.repeat_interleave(num_samples, dim=0)
+        elif prompt_embeds.shape[0] != num_samples:
             if prompt_embeds.shape[0] == 1:
                 prompt_embeds = prompt_embeds.repeat(num_samples, 1, 1)
                 if prompt_attention_mask is not None:
@@ -847,29 +945,43 @@ class BaseImageGenerator:
         with torch.no_grad():
             for i in range(num_steps):
                 t = timesteps[i] if i < len(timesteps) else boundary_timesteps[-1]
-                t_batch = t.expand(num_samples).to(self.dtype)
+                # Per-sample timestep (batch n) for the scheduler step; the DiT
+                # forward instead sees a 2n batch when CFG duplicates latents.
+                t_sample = t.expand(num_samples).to(self.dtype)
+                t_model = t_sample.repeat(2) if do_cfg else t_sample
+                latent_model_input = torch.cat([latents] * 2, dim=0) if do_cfg else latents
 
                 # Local NVFP4DiT forward signature:
                 #   forward(x, t, encoder_hidden_states=None, quantization_error_info=None)
                 # Pass ``prompt_embeds`` as the 3rd positional arg, do not pass
                 # ``encoder_attention_mask`` because local DiT ignores it.
-                output = self.transformer(
-                    latents.to(self.dtype),
-                    t_batch,
+                output, logit = self.transformer(
+                    latent_model_input.to(self.dtype),
+                    t_model,
                     prompt_embeds.to(self.dtype),
                 )
 
+                # Classifier-free guidance: chunk the 2n batch into (uncond,
+                # cond) and mix. Without CFG, noise_pred is just the raw output.
+                if do_cfg:
+                    noise_pred_uncond, noise_pred_text = output.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+                else:
+                    noise_pred = output
+
                 if return_intermediates:
-                    dit_outputs.append(output.detach().cpu())
+                    dit_outputs.append(noise_pred.detach().cpu())
                     intermediate_latents.append(latents.detach().cpu())
 
                 # Update latents via scheduler (mirrors compute_distillation_loss)
                 if is_fm:
                     dt = (boundary_timesteps[i + 1] - boundary_timesteps[i]) if (i + 1) < len(boundary_timesteps) else -1.0 / num_steps
-                    latents = latents + output * dt
+                    latents = latents + noise_pred * dt
                 else:  # DDPM
                     latents = self.scheduler.step(
-                        output, t_batch, latents, return_dict=False,
+                        noise_pred, t_sample, latents, return_dict=False,
                     )[0]
 
                 if return_intermediates:
@@ -1293,7 +1405,7 @@ class BaseImageGenerator:
         cali_dataloader, _ = get_dataloader(
             dataset_name=calibrate_dataset_name,
             dataset_config=dataset_config,
-            vae=self.vae, tokenizer=self.tokenizer, text_encoder=self.text_encoder,
+            vae=self.vae, tokenizer=self.tokenizer, text_encoder=self.text_encoder
         )
 
         print(f">> [{time.time() - cur_time:.2f}] Finish loading dataset "

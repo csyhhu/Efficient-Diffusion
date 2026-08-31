@@ -9,7 +9,7 @@ patch_size: 2            # 4/2 = 2 → 4 tokens
 
 # Transformer architecture
 hidden_dim: 256          # hidden dimension of transformer
-depth: 1                 # number of DiT blocks
+depth: 16                # number of DiT blocks
 num_heads: 4             # attention heads (must divide hidden_dim)
 time_dim: 256            # time embedding dimension
 mlp_ratio: 4.0           # MLP hidden / transformer hidden ratio

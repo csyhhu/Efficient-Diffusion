@@ -54,6 +54,8 @@ from src.quant_utils.permutation import (
 )
 from src.modules.quantized_linear import NVFP4Linear
 
+from src.utils import compute_computation_diff
+
 
 # ===========================================================================
 # Sinusoidal position-encoding helpers (exact diffusers replicas)
@@ -477,13 +479,26 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor,
-                quantization_error_info: dict = None) -> torch.Tensor:
+                quantization_error_info: dict = None,
+                computation_diff_dict: dict = None) -> torch.Tensor:
+        """Forward pass with optional change capture.
+
+        Args:
+            return_computation_diff: when True, write FF-module before/after tensors and
+                per-token rel_l2 into ``self.computation_diff_dict``. Tensors are stored
+                detached + on CPU (``.detach().cpu()``) so the dict can be
+                inspected after forward without holding the autograd graph.
+        """
+        if computation_diff_dict is not None:
+            computation_diff_dict[f"{self.layer_prefix}.before"] = hidden_states.detach().cpu()
         # net[0] is GELUActivation (needs quantization_error_info)
         # net[1] is Dropout (no args)
         # net[2] is NVFP4Linear (needs quantization_error_info)
         hidden_states = self.net[0](hidden_states, quantization_error_info)
         hidden_states = self.net[1](hidden_states)
         hidden_states = self.net[2](hidden_states, quantization_error_info)
+        if computation_diff_dict is not None:
+            computation_diff_dict[f"{self.layer_prefix}.after"] = hidden_states.detach().cpu()
         return hidden_states
 
 
@@ -602,16 +617,31 @@ class JointAttention(nn.Module):
         B, _, N, _ = x.shape
         return x.transpose(1, 2).reshape(B, N, -1)
 
-    def forward(self, hidden_states: torch.Tensor,
-                encoder_hidden_states: torch.Tensor,
-                quantization_error_info: dict = None):
+    def forward(
+        self, hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        quantization_error_info: dict = None,
+        computation_diff_dict: dict = None,
+        # skip_plan: dict = None # [seq_len, num_head]
+    ):
         """Args:
             hidden_states: (B, N_img, D) image tokens.
             encoder_hidden_states: (B, N_txt, D) text tokens (ignored when
             ``has_added_kv=False``).
+            computation_diff_dict: capture before/after tensors and attention
+                weights into ``self.computation_diff_dict``. Tensors are stored detached +
+                on CPU (``.detach().cpu()``) so the dict can be inspected after
+                forward without holding the autograd graph.
         Returns:
             attn_img: (B, N_img, D), attn_txt: (B, N_txt, D) or None.
         """
+        # Each module owns its own self.computation_diff_dict. Clear at the START of each
+        # forward so repeated calls don't accumulate stale entries.
+        # print(f"Processing {self.layer_prefix} ...")
+        if computation_diff_dict is not None:
+            img_before = hidden_states
+            txt_before = encoder_hidden_states
+
         batch_size = hidden_states.shape[0]
         n_img = hidden_states.shape[1]
 
@@ -631,7 +661,22 @@ class JointAttention(nn.Module):
 
         # Pure self-attention path (attn2 in SD3.5 dual-attention blocks):
         if not self.has_added_kv:
+            # Always use fused SDPA for the actual output — guarantees the
+            # instrumented path produces byte-identical output to baseline.
             attn_output = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+            """
+            if computation_diff_dict is not None:
+                # As a separate BYPRODUCT compute softmax(QK^T/√d) for weight
+                # recovery.  This duplicates the Q·Kᵀ matmul when diff is
+                # requested, but keeps the SDPA path identical across runs.
+                scale = 1.0 / math.sqrt(self.head_dim)
+                with torch.no_grad():
+                    attn_scores = torch.matmul(query.float(), key.float().transpose(-2, -1)) * scale
+                    attn_weights = F.softmax(attn_scores, dim=-1).to(query.dtype)
+                # computation_diff_dict[f"{self.layer_prefix}.attn_weights"] = attn_weights.detach().cpu()
+                # [bs, n_heads, n_img, dim] => [n_heads, n_img]
+                computation_diff_dict[f"{self.layer_prefix}.attn"] = compute_computation_diff(value, attn_output, dim=[0, -1])
+            """
             attn_output = attn_output.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
             attn_output = attn_output.to(query.dtype)
             attn_output = self.to_out[0](attn_output, quantization_error_info)
@@ -657,7 +702,21 @@ class JointAttention(nn.Module):
         key = torch.cat([key, encoder_key], dim=2)
         value = torch.cat([value, encoder_value], dim=2)
 
+        # Always use fused SDPA for actual output (identical regardless of
+        # return_computation_diff). Weight recovery is an orthogonal byproduct computed
+        # below when needed — duplicates Q·Kᵀ matmul, keeps output identical.
         attn_output = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+        """
+        if computation_diff_dict is not None:
+            scale = 1.0 / math.sqrt(self.head_dim)
+            with torch.no_grad():
+                attn_scores = torch.matmul(query.float(), key.float().transpose(-2, -1)) * scale
+                attn_weights = F.softmax(attn_scores, dim=-1).to(query.dtype)
+            # computation_diff_dict[f"{self.layer_prefix}.attn_weights"] = attn_weights.detach().cpu()
+            # computation_diff_dict[f"{self.layer_prefix}.attn"]= {"before": value.detach().cpu()}   
+            # computation_diff_dict[f"{self.layer_prefix}.attn"]["after"] = attn_output.detach().cpu()
+            computation_diff_dict[f"{self.layer_prefix}.attn"]= compute_computation_diff(value, attn_output, dim=[0, -1])
+        """
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         attn_output = attn_output.to(query.dtype)
 
@@ -668,9 +727,14 @@ class JointAttention(nn.Module):
         attn_img = self.to_out[1](attn_img)
 
         if self.context_pre_only:
+            if computation_diff_dict is not None:
+                computation_diff_dict[f"{self.layer_prefix}.img"] = compute_computation_diff(img_before, attn_img, dim=[0, -1])
             return attn_img, None
 
         attn_txt = self.to_add_out(attn_txt, quantization_error_info)
+        # Scale A: joint-attn final outputs (both streams, after output projection)
+        if computation_diff_dict is not None:
+            computation_diff_dict[f"{self.layer_prefix}.txt"] = compute_computation_diff(txt_before, attn_txt, dim=[0, -1])
         return attn_img, attn_txt
 
 
@@ -776,7 +840,53 @@ class JointTransformerBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor,
                 encoder_hidden_states: torch.Tensor,
                 temb: torch.Tensor,
-                quantization_error_info: dict = None) -> tuple:
+                skip_plan: dict or float = None,
+                quantization_error_info: dict = None,
+                computation_diff_dict: dict = None) -> tuple:
+
+        if computation_diff_dict is not None: 
+            img_before = hidden_states
+            txt_before = encoder_hidden_states
+
+        n_latent_seq = hidden_states.shape[1]
+        n_txt_seq = encoder_hidden_states.shape[1]
+        # print(skip_plan.keys())
+        if isinstance(skip_plan, dict):
+            token_skip_plan = skip_plan.get(f"{self.layer_prefix}", None)
+            # print(len(token_skip_plan))
+            if token_skip_plan is not None:
+                latent_skip_token = [t for t in token_skip_plan if t < n_latent_seq]
+                text_skip_token = [t - n_latent_seq for t in token_skip_plan if t >= n_latent_seq and t < n_txt_seq + n_latent_seq]
+                # print(len(latent_skip_token), len(text_skip_token))
+            else:
+                latent_skip_token = None
+                text_skip_token = None
+        elif isinstance(skip_plan, float):
+            latent_skip_token = torch.randperm(n_latent_seq)[:int(skip_plan * n_latent_seq)]
+            text_skip_token = torch.randperm(n_txt_seq)[:int(skip_plan * n_txt_seq)]
+        else:
+            latent_skip_token = None
+            text_skip_token = None
+
+        if latent_skip_token is not None and len(latent_skip_token) > 0:
+            full_hidden_states = hidden_states
+            latent_skip_token = torch.tensor(latent_skip_token)
+            latent_skip_mask = torch.zeros(n_latent_seq, dtype=torch.bool)
+            # print(latent_skip_token)
+            latent_skip_mask[latent_skip_token] = True
+            latent_keep_mask = ~latent_skip_mask
+            hidden_states = full_hidden_states[:, latent_keep_mask, :]
+            # print(f"[{self.layer_prefix}] skip img tokens: {latent_skip_token} | {full_hidden_states.shape} -> {hidden_states.shape}")
+        
+        if text_skip_token is not None and len(text_skip_token) > 0:
+            full_encoder_hidden_states = encoder_hidden_states
+            text_skip_token = torch.tensor(text_skip_token)
+            text_skip_mask = torch.zeros(n_txt_seq, dtype=torch.bool)
+            text_skip_mask[text_skip_token] = True
+            text_keep_mask = ~text_skip_mask
+            encoder_hidden_states = full_encoder_hidden_states[:, text_keep_mask, :]
+            # print(f"[{self.layer_prefix}] skip txt tokens: {text_skip_token} | {full_encoder_hidden_states.shape} -> {encoder_hidden_states.shape}")
+
         # ---- Image norm ----
         # Dual-attention blocks use SD35AdaLayerNormZeroX which returns 7
         # values (the extra norm_hidden_states2 / gate_msa2 feed attn2).
@@ -806,6 +916,7 @@ class JointTransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             quantization_error_info=quantization_error_info,
+            computation_diff_dict=computation_diff_dict,
         )
 
         # Image: residual + gate
@@ -817,14 +928,18 @@ class JointTransformerBlock(nn.Module):
                 hidden_states=norm_hidden_states2,
                 encoder_hidden_states=norm_encoder_hidden_states,
                 quantization_error_info=quantization_error_info,
+                computation_diff_dict=computation_diff_dict,
             )
             hidden_states = hidden_states + gate_msa2.unsqueeze(1) * attn_output2
 
         # Image: FF
         norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        ff_output = self.ff(norm_hidden_states,
-                            quantization_error_info=quantization_error_info)
+        ff_output = self.ff(
+            norm_hidden_states,
+            quantization_error_info=quantization_error_info,
+            # computation_diff_dict=computation_diff_dict
+        )
         hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
 
         # ---- Text path ----
@@ -836,8 +951,29 @@ class JointTransformerBlock(nn.Module):
             norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
             context_ff_output = self.ff_context(
                 norm_encoder_hidden_states,
-                quantization_error_info=quantization_error_info)
+                quantization_error_info=quantization_error_info,
+                # computation_diff_dict=computation_diff_dict,
+            )
             encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+
+        if latent_skip_token is not None and len(latent_skip_token) > 0:
+            full_hidden_states[:, latent_keep_mask, :] = hidden_states
+            hidden_states = full_hidden_states
+
+        if text_skip_token is not None and len(text_skip_token) > 0:
+            full_encoder_hidden_states[:, text_keep_mask, :] = encoder_hidden_states
+            encoder_hidden_states = full_encoder_hidden_states
+
+        # block outputs (after full attn + FF + residual + gate)
+        # NOTE: capture diff AFTER skip restoration so img_after/txt_after have
+        # the same full shape as img_before/txt_before (captured at block entry).
+        if computation_diff_dict is not None:
+            img_after = hidden_states
+            # [bs, n_img, dim] => [n_img]
+            computation_diff_dict[f"{self.layer_prefix}.img"] = compute_computation_diff(img_before, img_after, dim=[0, -1])
+            if encoder_hidden_states is not None:
+                txt_after = encoder_hidden_states
+                computation_diff_dict[f"{self.layer_prefix}.txt"] = compute_computation_diff(txt_before[:, :77, :], txt_after[:, :77, :], dim=[0, -1])
 
         return encoder_hidden_states, hidden_states
 
@@ -881,7 +1017,7 @@ class NVFP4QuantizedSD3(nn.Module):
         block_size: int = 16,
         use_nvfp4: bool = True,
         rotation="identity",
-        permutation="identity",
+        permutation="identity"
     ):
         super().__init__()
         out_channels = out_channels or in_channels
@@ -973,7 +1109,10 @@ class NVFP4QuantizedSD3(nn.Module):
 
         self.gradient_checkpointing = False
         self.quantization_error_info: dict = {}
-        print(f"Initialize SD3 Transformer {'Quantized' if use_nvfp4 else 'Unquantized'} mode, "
+        # Aggregated per-module diff records (populated after forward when
+        # return_computation_diff=True by collecting each sub-module's self.computation_diff_dict)
+        # self.computation_diff_dict = {}
+        print(f"Initialize SD3 Transformer {'[Quantized]' if use_nvfp4 else '[Unquantized]'} mode, "
               f"block_size={block_size}, rotation={self.rotation}, permutation={self.permutation})")
 
     @property
@@ -1330,6 +1469,8 @@ class NVFP4QuantizedSD3(nn.Module):
         block_controlnet_hidden_states=None,
         joint_attention_kwargs=None,
         skip_layers=None,
+        return_computation_diff: bool = False,
+        skip_plan: dict or float = None,
     ):
         """Matches ``SD3Transformer2DModel.forward``.
 
@@ -1347,6 +1488,11 @@ class NVFP4QuantizedSD3(nn.Module):
         Returns:
             ``(output,)`` tuple or dict-like with ``.sample``.
         """
+        if return_computation_diff:
+            computation_diff_dict = {}
+        else:
+            computation_diff_dict = None
+
         height, width = hidden_states.shape[-2:]
 
         # 1. Patch embed + position
@@ -1376,6 +1522,8 @@ class NVFP4QuantizedSD3(nn.Module):
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     quantization_error_info=quantization_error_info,
+                    computation_diff_dict=computation_diff_dict,
+                    skip_plan=skip_plan,
                 )
 
         # 4. Output normalization
@@ -1398,6 +1546,9 @@ class NVFP4QuantizedSD3(nn.Module):
             hidden_states.shape[0], self.out_channels, height, width,
         )
 
+        if return_computation_diff:
+            output = output, computation_diff_dict
+
         if not return_dict:
             return (output,)
 
@@ -1412,7 +1563,7 @@ if __name__ == "__main__":
     import time
     from diffusers import SD3Transformer2DModel
 
-    bs = 2
+    bs = 1 
     in_channels = 16
     height = 16
     width = 16
@@ -1441,21 +1592,28 @@ if __name__ == "__main__":
         cache_dir="G://models",
         local_files_only=True,
         torch_dtype=dtype,
-        rotation="identity",
-        permutation="identity",
-        nvfp4_quantize=False,
+        rotation=None,
+        permutation=None,
+        use_nvfp4=False,
     ).to(device, dtype=dtype)
     
     load_time = time.time() - cur
     print(f"Model loading time: {load_time:.4f} seconds")
-    gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
-    print(f"Peak GPU memory: {gpu_mem:.2f} GB")
-    import psutil
-    rss = psutil.Process().memory_info().rss / 1024**3
-    print(f"Process RSS: {rss:.2f} GB")
+    y = model(
+        hidden_states, encoder_hidden_states, pooled_projections, timestep,
+        return_dict=True
+        , return_computation_diff=True
+    ).sample
+    # print(f"Model output shape: {y.shape}")
+
+    # gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+    # print(f"Peak GPU memory: {gpu_mem:.2f} GB")
+    # import psutil
+    # rss = psutil.Process().memory_info().rss / 1024**3
+    # print(f"Process RSS: {rss:.2f} GB")
     """
     
-    # """
+    """
     # ---- Original diffusers SD3Transformer2DModel ----
     # model_ori = SD3Transformer2DModel(
     #     sample_size=16,
@@ -1472,6 +1630,7 @@ if __name__ == "__main__":
     #     dual_attention_layers=(),
     #     qk_norm="rms_norm",
     # ).to(device, dtype=dtype)
+
     cur = time.time()
     model_ori = SD3Transformer2DModel.from_pretrained(
         "G://models//stabilityai//stable-diffusion-3.5-medium",
@@ -1485,10 +1644,13 @@ if __name__ == "__main__":
         hidden_states, encoder_hidden_states, pooled_projections, timestep,
         return_dict=True,
     ).sample
-    print(f"Original model output shape: {y_ori.shape}")
-    load_time = time.time() - cur
-    print(f"Origin model loading+forward time: {load_time:.4f} seconds")
-
+    # print(f"Original model output shape: {y_ori.shape}")
+    # load_time = time.time() - cur
+    # print(f"Origin model loading+forward time: {load_time:.4f} seconds")
+    
+    print(torch.mean(torch.abs(y_ori - y)))
+    """
+    """
     # Free origin model to save memory for NVFP4 model
     del model_ori
     gc.collect()
@@ -1521,4 +1683,54 @@ if __name__ == "__main__":
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-
+    """
+    """
+    # Test return diff 
+    model = NVFP4QuantizedSD3.from_pretrained(
+        "G://models//stabilityai//stable-diffusion-3.5-medium",
+        cache_dir="G://models",
+        local_files_only=True,
+        torch_dtype=dtype,
+        use_nvfp4=False,
+        rotation=None,
+        permutation=None,
+        nvfp4_quantize=False,
+    ).to(device, dtype=dtype)
+    y, computation_diff_dict = model(
+        hidden_states, encoder_hidden_states, pooled_projections,
+        timestep, 
+        # return_dict=True,
+        return_computation_diff=True
+    ).sample
+    for key, value in computation_diff_dict.items():
+        if isinstance(value, dict):
+            for subKey, subValue in value.items():
+                print(f"{key}.{subKey}: {subValue.shape}, {torch.mean(subValue)}")
+        else:
+            print(f"{key}: {value.shape}, {torch.mean(value)}")
+    """
+    # Test token skip plan
+    # n_skip = 16
+    # skip_plan = {"block.0.img": torch.randperm(in_channels)[:n_skip].to(device)}
+    with open("G://Outputs//Efficient-Diffusion//computation_diff//SD3-MJHQ30K//token_skip_plan.json", "r") as f:
+        skip_plan = json.load(f)
+    model = NVFP4QuantizedSD3.from_pretrained(
+        "G://models//stabilityai//stable-diffusion-3.5-medium",
+        cache_dir="G://models",
+        local_files_only=True,
+        torch_dtype=dtype,
+        use_nvfp4=False,
+        rotation=None,
+        permutation=None,
+        nvfp4_quantize=False,
+    ).to(device, dtype=dtype)
+    y = model(
+        hidden_states, encoder_hidden_states, 
+        pooled_projections,
+        timestep, 
+        skip_plan=skip_plan.get("0")
+        # skip_plan=0.5
+    ).sample
+    print(y.shape)
+    
+    

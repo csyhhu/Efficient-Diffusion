@@ -23,6 +23,7 @@ import os
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
@@ -170,11 +171,40 @@ class CIFAR100RawDataset(Dataset):
         return image, label, prompt
 
 
+def _resolve_precomputed_path(precomputed_path: str, train: bool, image_size: int) -> str:
+    """Resolve the concrete cache file path.
+
+    If ``precomputed_path`` points to a directory (or a path with missing
+    extension), a split-specific filename is constructed inside it so train
+    and test sets with different image sizes do not collide.
+    """
+    if precomputed_path is None:
+        return None
+    ext = os.path.splitext(precomputed_path)[1].lower()
+    if ext in (".pt", ".pth", ".bin"):
+        return precomputed_path
+    os.makedirs(precomputed_path, exist_ok=True)
+    split = "train" if train else "test"
+    fname = f"{split}_imgsz_{image_size}.pt"
+    return os.path.join(precomputed_path, fname)
+
+
 class CIFAR100LatentDataset(Dataset):
     """CIFAR-100 latent dataset for text-conditional diffusion training.
 
-    Computes VAE latents and text embeddings on-the-fly during training,
-    avoiding memory overhead of pre-computing all data.
+    Two modes:
+
+    1. **Precomputed-cache mode** (``precomputed_path is not None``):
+       VAE latents and text embeddings are loaded from / saved to a single
+       ``.pt`` file on disk.  Encoding happens in one batched pass the first
+       time, which is much faster than per-sample GPU kernels.  After that,
+       ``__getitem__`` returns pure CPU tensors so ``num_workers > 0`` and
+       ``pin_memory = True`` become safe and beneficial.
+
+    2. **On-the-fly mode** (``precomputed_path is None``):
+       Keeps the original behaviour — ``vae.encode`` and ``text_encoder`` are
+       called inside ``__getitem__``.  Requires ``num_workers = 0`` because
+       CUDA ops cannot run in DataLoader worker processes.
 
     Yields tuples:
     - latent: (C, H, W) VAE latent tensor
@@ -192,6 +222,7 @@ class CIFAR100LatentDataset(Dataset):
         device: torch.device = None,
         dtype: torch.dtype = torch.float32,
         max_token_length: int = 77,
+        precomputed_path: str = None,
     ):
         self.vae = vae
         self.tokenizer = tokenizer
@@ -199,6 +230,8 @@ class CIFAR100LatentDataset(Dataset):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.max_token_length = max_token_length
+        self.image_size = image_size
+        self.train = train
 
         if vae is not None:
             self.vae_scale = vae.config.scaling_factor
@@ -212,12 +245,160 @@ class CIFAR100LatentDataset(Dataset):
             root=root, train=train, download=True, transform=transform
         )
 
-        print(f"[data] CIFAR100LatentDataset initialized: {len(self.dataset)} samples")
+        # ---- Precomputed cache handling ---------------------------------
+        # When precomputed_path is None we fall through and use the legacy
+        # on-the-fly encode path in __getitem__ (requires num_workers=0).
+        self._cached_latents = None
+        self._cached_class_text_embs = None  # (num_classes, seq_len, dim)
+        self._cached_labels = None           # (N,) int64 — for label lookup
+        self._cache_path = _resolve_precomputed_path(precomputed_path, train, image_size)
 
+        if self._cache_path is not None and os.path.exists(self._cache_path):
+            print(f"[data] Loading precomputed CIFAR-100 cache from: {self._cache_path}")
+            obj = torch.load(self._cache_path, map_location="cpu")
+            self._cached_latents = obj["latents"]
+            self._cached_class_text_embs = obj["class_text_embs"]
+            self._cached_labels = obj["labels"]
+            if len(self._cached_latents) != len(self.dataset):
+                raise RuntimeError(
+                    f"Cached latents length {len(self._cached_latents)} does not match "
+                    f"dataset length {len(self.dataset)} at {self._cache_path}. "
+                    f"Please delete the stale cache and retry."
+                )
+            print(f"[data] Loaded cache: latents {tuple(self._cached_latents.shape)}, "
+                  f"class_text_embs {tuple(self._cached_class_text_embs.shape)}, "
+                  f"labels {tuple(self._cached_labels.shape)}")
+
+        elif self._cache_path is not None:
+            # Need to generate the cache.  Models must be supplied.
+            missing = [n for n, m in (("vae", vae), ("tokenizer", tokenizer), ("text_encoder", text_encoder)) if m is None]
+            if missing:
+                raise RuntimeError(
+                    f"precomputed_path={self._cache_path} does not exist, "
+                    f"but {missing} were not provided to build the cache. "
+                    f"Pass vae/tokenizer/text_encoder or an existing cache file."
+                )
+            print(f"[data] precomputed_path not yet on disk; building cache once: {self._cache_path}")
+            latents, class_text_embs, labels = self._precompute_all(precompute_batch_size=256)
+            self._cached_latents = latents
+            self._cached_class_text_embs = class_text_embs
+            self._cached_labels = labels
+            save_dir = os.path.dirname(self._cache_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            torch.save(
+                {"latents": latents, "class_text_embs": class_text_embs, "labels": labels},
+                self._cache_path,
+            )
+            mem_mb = (latents.nelement() * latents.element_size()
+                      + class_text_embs.nelement() * class_text_embs.element_size()
+                      + labels.nelement() * labels.element_size()) / 1024 / 1024
+            print(f"[data] Cache written to disk ({mem_mb:.1f} MB).")
+
+        # Fall-through: if precomputed_path is None we keep the legacy path.
+        print(f"[data] CIFAR100LatentDataset initialized: {len(self.dataset)} samples "
+              f"(cached={self._cached_latents is not None})")
+
+    # ------------------------------------------------------------------
+    # Batched precomputation
+    # ------------------------------------------------------------------
+    def _precompute_all(self, precompute_batch_size: int = 256):
+        """Encode the whole split in large batches and return CPU tensors.
+
+        To avoid the 11.8 GB memory blow-up from caching per-sample text
+        embeddings (50000 x 77 x 768 x 4B), we only cache:
+          - image latents:  (N, C, H, W)            — ~12.8 MB for CIFAR-100
+          - class_text_embs:(num_classes, seq, dim) — ~23.7 MB (100 classes)
+          - labels:         (N,) int64              — ~0.4 MB
+        ``__getitem__`` looks up the text embedding by label at access time,
+        so prompt diversity is reduced to one fixed template per class in
+        cached mode (on-the-fly mode still uses random templates).
+        """
+        N = len(self.dataset)
+        num_classes = len(CIFAR100_CLASSES)
+
+        # Probe latent shape with a single sample.
+        img0, _ = self.dataset[0]
+        with torch.no_grad():
+            enc = self.vae.encode(img0.unsqueeze(0).to(self.device, self.dtype))
+            if hasattr(enc, "latent_dist"):
+                z0 = enc.latent_dist.sample()
+            elif hasattr(enc, "latent"):
+                z0 = enc.latent
+            elif hasattr(enc, "latents"):
+                z0 = enc.latents
+            else:
+                z0 = enc
+            z0 = (z0 * self.vae_scale).squeeze(0).cpu()
+        latent_shape = tuple(z0.shape)  # e.g. (4, 4, 4)
+
+        all_latents = torch.empty((N,) + latent_shape, dtype=z0.dtype, device="cpu")
+        all_labels = torch.empty(N, dtype=torch.long, device="cpu")
+
+        # Build a raw-image DataLoader so we can feed the VAE with big batches.
+        raw_loader = DataLoader(
+            self.dataset,
+            batch_size=precompute_batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
+        )
+
+        offset = 0
+        pbar = tqdm(raw_loader, desc=f"Precomputing {'train' if self.train else 'test'} latents")
+        with torch.no_grad():
+            for images, labels in pbar:
+                B = images.shape[0]
+                images_dev = images.to(self.device, self.dtype)
+
+                # --- VAE encode ---
+                enc = self.vae.encode(images_dev)
+                if hasattr(enc, "latent_dist"):
+                    lat = enc.latent_dist.sample()
+                elif hasattr(enc, "latent"):
+                    lat = enc.latent
+                elif hasattr(enc, "latents"):
+                    lat = enc.latents
+                else:
+                    lat = enc
+                lat = (lat * self.vae_scale).cpu()
+
+                all_latents[offset:offset + B].copy_(lat)
+                all_labels[offset:offset + B].copy_(labels)
+                offset += B
+
+        # --- Encode one prompt per class (fixed template) ----------------
+        # Using PROMPT_TEMPLATES[0] = "a photo of a {}" for deterministic,
+        # compact cache.  On-the-fly mode (precomputed_path=None) still
+        # uses random templates via generate_prompt().
+        class_prompts = [PROMPT_TEMPLATES[0].format(c.replace("_", " ")) for c in CIFAR100_CLASSES]
+        with torch.no_grad():
+            tok = self.tokenizer(
+                class_prompts, max_length=self.max_token_length,
+                padding="max_length", truncation=True, return_tensors="pt",
+            )
+            class_text_embs = self.text_encoder(
+                tok.input_ids.to(self.device),
+                attention_mask=tok.attention_mask.to(self.device),
+            ).last_hidden_state.cpu()
+
+        return all_latents, class_text_embs, all_labels
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Cached mode: pure CPU tensor lookup — safe with num_workers > 0.
+        if self._cached_latents is not None:
+            label = self._cached_labels[idx].item()
+            return self._cached_latents[idx], self._cached_class_text_embs[label], F.one_hot(torch.tensor(label), num_classes=100)
+
+        # On-the-fly mode (precomputed_path=None): per-sample GPU encode.
+        # Requires num_workers=0 because VAE/text_encoder live on CUDA.
         image, label = self.dataset[idx]
         class_name = CIFAR100_CLASSES[label]
         prompt = generate_prompt(class_name)
@@ -248,7 +429,7 @@ class CIFAR100LatentDataset(Dataset):
                 attention_mask=text_inputs.attention_mask.to(self.device),
             ).last_hidden_state
 
-        return latent.squeeze(0), text_emb.squeeze(0)
+        return latent.squeeze(0), text_emb.squeeze(0), F.one_hot(torch.tensor(label), num_classes=100)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +450,7 @@ def get_cifar100_dataloader(
     device: torch.device = None,
     dtype: torch.dtype = torch.float32,
     max_token_length: int = 77,
+    precomputed_path: str = None,
 ) -> DataLoader:
     """Create a CIFAR-100 DataLoader.
 
@@ -289,15 +471,28 @@ def get_cifar100_dataloader(
         device: Target device for pre-computation
         dtype: Data type for pre-computation
         max_token_length: Maximum token length for text encoder
+        precomputed_path: Path to a ``.pt`` file OR a directory.  When set,
+            VAE latents and text embeddings are encoded once in large
+            batches (256) and persisted on disk; subsequent runs load them
+            directly from disk so ``__getitem__`` becomes a pure CPU
+            tensor lookup (safe and fast with ``num_workers > 0``).
 
     Returns:
         DataLoader for CIFAR-100
     """
     print(
-        f">> [data] Loading cifar100 from [{root}] [{image_size} x {image_size}] batch size: {batch_size}" 
+        f"[data] Loading cifar100 from [{root}] [{image_size} x {image_size}] batch size: {batch_size}"
         f" using vae={vae is not None}, tokenizer={tokenizer is not None}, text_encoder={text_encoder is not None}"
+        f" precomputed_path={precomputed_path}"
     )
-    if vae is not None and tokenizer is not None and text_encoder is not None:
+    # If an existing precomputed cache is specified, we can enter latent mode
+    # without the models — they are only needed the very first time to build
+    # the cache file.
+    has_latent_parts = (
+        (vae is not None and tokenizer is not None and text_encoder is not None)
+        or precomputed_path is not None
+    )
+    if has_latent_parts:
         dataset = CIFAR100LatentDataset(
             root=root,
             train=train,
@@ -308,6 +503,7 @@ def get_cifar100_dataloader(
             device=device,
             dtype=dtype,
             max_token_length=max_token_length,
+            precomputed_path=precomputed_path,
         )
     else:
         dataset = CIFAR100RawDataset(
@@ -399,7 +595,8 @@ if __name__ == "__main__":
     train_loader = get_cifar100_dataloader(
         # batch_size=16, train=True, image_size=64, 
         # root="G://datasets//cifar-100-python", 
-        vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, device=device, dtype=dtype
+        vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, device=device, dtype=dtype,
+        precomputed_path="G://datasets//cifar-100-python//latent_cache"
     )
     latents, txt_embs = next(iter(train_loader))
     print(latents.shape, txt_embs.shape)

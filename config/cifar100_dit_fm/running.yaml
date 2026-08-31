@@ -9,10 +9,19 @@ scheduler: "fm"           # triggers FlowMatchingScheduler
 num_steps: 50            # number of sampling steps
 
 # ── Training ──
-lr: 0.0001               # learning rate (Adam)
-epochs: 1                # number of training epochs (reduced for testing)
-output_dir: "G:///Outputs/cifar100_dit_fm"  # output directory for checkpoints and samples
+lr: 0.0001                 # learning rate (Adam)
+epochs: 100                # number of training epochs (reduced for testing)
+output_dir: "G:///Outputs/Efficient-Diffusion/cifar100_dit_fm_16layer"  # output directory for checkpoints and samples
 test_prompt: "A cat"  # test prompt for sample generation
+# ── Classifier-Free Guidance (CFG) ──
+# cfg_dropout: prob of replacing a sample's text embedding with the cached
+#   empty-string (unconditional) embedding during training (0.0 = no CFG).
+#   Set to ~0.1-0.15 to enable CFG training; the null token matches the
+#   negative_prompt="" branch used by _custom_generate at inference.
+# guidance_scale: CFG scale used for the periodic qualitative samples
+#   (1.0 = no guidance, >1.0 enables CFG mixing at inference).
+cfg_dropout: 0.1
+guidance_scale: 3.5
 
 # ── Performance optimizations ──
 torch_compile: false      # Enable torch.compile for speedup (requires triton)
@@ -21,4 +30,10 @@ gradient_checkpointing: false  # Enable gradient checkpointing (trades memory fo
 mixed_precision: "bf16"   # Mixed precision: "bf16", "fp16", or null
 
 # ── Sampling ──
-sample_interval: 10      # generate sample images every N epochs
+sample_interval: 1      # generate sample images every N epochs
+
+# ── Logging ──
+record_interval: 1      # record loss every N samples
+
+# ── Checkpoint ──
+save_interval: 1        # save checkpoint every N epochs

@@ -10,10 +10,10 @@ Four modes (all with seed=42):
 Run as:
 python test/test_model_download_generation.py `
     --model_id "stabilityai/stable-diffusion-3.5-medium" `
-    --prompt "A cute cat" `
     --seed 42 `
     --output_dir "G://Outputs//Efficient-Diffusion//generation//SD3" `
-    --filename cat
+    --prompt "A cute cat" `
+    --filename cat_2
 
 python test/test_model_download_generation.py `
     --model_id "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers" `
@@ -130,6 +130,8 @@ if __name__ == "__main__":
     parser.add_argument("--model_id", type=str, default="stabilityai/stable-diffusion-3.5-medium")
     parser.add_argument("--config_path", type=str, default="config/cifar100_dit_fm")
     parser.add_argument("--cache_dir", type=str, default="G://models")
+    parser.add_argument("--dataset_name", type=str, default="mjhq30k")
+    parser.add_argument("--dataset_path", type=str, default="G://datasets/MJHQ-30K")
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -183,6 +185,7 @@ if __name__ == "__main__":
     # 2. Load ImageGenerator
     # ------------------------------------------------------------------
     # """
+    local_mode = False
     if args.model_id == "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers":
         Gen = SanaImageGenerator
     elif args.model_id == "stabilityai/stable-diffusion-3.5-medium":
@@ -242,13 +245,15 @@ if __name__ == "__main__":
     # """
     print(f"\n[4/4] _im: ImageGenerator custom generate + NVFP4 transformer")
     gen.generate(
-        prompt=args.prompt,
+        # prompt=args.prompt,
+        dataset_name=args.dataset_name,
+        dataset_path=args.dataset_path,
         num_samples=4,
-        visual_n_row=4,
         seed=args.seed,
         num_steps=args.num_steps,
         used_origin_pipe=False,
         save_root=args.output_dir,
-        save_name=f"{args.filename}_im.png",
+        # visual_n_row=4,
+        # save_name=f"{args.filename}_im.png",
     )
     # print(f"  Saved -> {os.path.join(args.output_dir, args.filename + '_im.png')}")

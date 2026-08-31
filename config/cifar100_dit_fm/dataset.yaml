@@ -1,12 +1,30 @@
 # CIFAR100 dataset config
 
-dataset_name: "CIFAR100"
-batch_size: 256          # training batch size (increased for better GPU utilization)
+dataset_name: "cifar100"
+batch_size: 256          # training batch size
 data_dir: "G://datasets//cifar-100-python"       # CIFAR100 download / storage directory
 image_size: 32          # CIFAR100 native resolution, no resize needed
-num_workers: 0          # DataLoader workers (0 required for GPU-based VAE encoding)
-pin_memory: false       # pin_memory disabled (data already on GPU from VAE encoding)
-persistent_workers: false  # Keep workers alive between epochs
+
+# Precomputed latent cache.
+# If set, VAE latents + text embeddings are encoded once in batched mode,
+# saved to this directory as ``train_imgsz_32.pt`` and ``test_imgsz_32.pt``,
+# and reloaded from disk in future runs.  This dramatically raises GPU
+# utilisation because ``__getitem__`` becomes a pure CPU tensor lookup and
+# DataLoader workers can feed the GPU without blocking on VAE/text_encoder
+# kernel launches.
+#
+# Leave empty / remove the key to fall back to on-the-fly per-sample encoding
+# (original behaviour, requires num_workers=0).
+precomputed_path: "G://datasets//cifar-100-python//latent_cache"
+
+# With precomputed cache on, ``__getitem__`` only touches CPU tensors so
+# DataLoader workers and pinned memory become both safe and profitable.
+# num_workers: 4
+# pin_memory: true
+# persistent_workers: true  # Keep workers alive between epochs
+num_workers: 0
+pin_memory: false
+persistent_workers: false
 
 # Text encoder settings
 max_token_length: 77
