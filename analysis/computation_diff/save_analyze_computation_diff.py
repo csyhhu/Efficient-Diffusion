@@ -14,19 +14,92 @@ import argparse
 import json
 import os
 import glob
+import numpy as np
 
 import torch
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from src.image_generator import SanaImageGenerator, SD3ImageGenerator
 from src.utils import compute_computation_diff
 
-from analysis.computation_diff.utils import load_samples, samples_to_avg, visualize
+from analysis.computation_diff.utils import load_samples, samples_to_avg, visualize_computation_diff
+
+
+def visualize_token_diff_distribution(diff_dict, save_path):
+    """
+    Visualize the distribution of computation diff.
+    Global: visualize the distribution of all tokens across different layers and steps.
+    Layer: visualize the distribution of tokens in each outer key.
+    """
+    all_token_diff = []
+    layer_token_diff = {}
+    for outer_key, inner_dict in diff_dict.items():
+        layer_token_diff[outer_key] = []
+        for inner_key, diff in inner_dict.items():
+            diff_flat = diff.flatten().float().numpy()
+            layer_token_diff[outer_key].append(diff_flat)
+            all_token_diff.append(diff_flat)
+
+    # Flatten per-layer lists into single arrays
+    all_token_diff = np.concatenate(all_token_diff) if all_token_diff else np.array([])
+    for k in layer_token_diff:
+        layer_token_diff[k] = np.concatenate(layer_token_diff[k])
+
+    # Layout: global spans the entire first row; per-group histograms start at row 1
+    group_names = list(layer_token_diff.keys())
+    group_type = "step" if group_names and group_names[0].startswith("step.") else "layer"
+    n_groups = len(group_names)
+    n_cols = min(5, max(1, n_groups))
+    n_rows = 1 + (n_groups + n_cols - 1) // n_cols  # 1 row for global + ceil(N/n_cols) rows for groups
+
+    fig = plt.figure(figsize=(n_cols * 3.5, n_rows * 3.0))
+
+    # Shared x-axis range for comparability
+    global_min = float(all_token_diff.min()) if len(all_token_diff) else 0
+    global_max = float(all_token_diff.max()) if len(all_token_diff) else 1
+    percentiles = list(range(10, 91, 10))  # 10, 20, ..., 90
+
+    def _draw_hist(ax, data, title):
+        ax.hist(data, bins=100, color='steelblue', edgecolor='black', alpha=0.7,
+                range=(global_min, global_max))
+        # Draw 10-90 percentile lines; median (50th) stands out
+        if len(data) > 0:
+            pcts = np.percentile(data, percentiles)
+            for p, v in zip(percentiles, pcts):
+                if p == 50:
+                    ax.axvline(v, color='red', linestyle='-', linewidth=1.2, alpha=0.8,
+                               label=f'p50={v:.3f}')
+                else:
+                    ax.axvline(v, color='red', linestyle='--', linewidth=0.7, alpha=0.5)
+        ax.set_title(title, fontsize=9)
+        ax.tick_params(axis='x', labelsize=8)
+        ax.tick_params(axis='y', labelsize=8)
+
+    # Global histogram spans the entire first row
+    ax_global = plt.subplot2grid((n_rows, n_cols), (0, 0), colspan=n_cols)
+    _draw_hist(ax_global, all_token_diff, f"Global token diff distribution (n={len(all_token_diff)})")
+    ax_global.legend(fontsize=7, loc='upper right')
+
+    # Per-group histograms starting at row 1
+    for idx, name in enumerate(group_names):
+        row = 1 + idx // n_cols
+        col = idx % n_cols
+        ax = plt.subplot2grid((n_rows, n_cols), (row, col))
+        _draw_hist(ax, layer_token_diff[name], f"{group_type} {name} (n={len(layer_token_diff[name])})")
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[visualize] saved token diff distribution to {save_path}")
 
 
 def generate_skip_plan(diff_dict, method="global", skip_ratio=0.5):
     """
     Generate token skip plan given computation dict values matrix.
-    diff_dict: {layer_name: {step_idx: [n_img + n_txt]}}
+    diff_dict: {layer_name: {step_idx: [n_img + n_txt]}} or {step_idx: {layer_name: [n_img + n_txt]}}
     Token skip plan: {step_idx: {layer_name: []}}
     global: Rank all tokens across different layers and steps, skip the tokens
         with the SMALLEST computation diff (most stable = most skippable).
@@ -98,6 +171,26 @@ def generate_skip_plan(diff_dict, method="global", skip_ratio=0.5):
             print(f"  Step {step_key}: {total_skip} tokens skipped "
                   f"across {n_layers} layers")
         return skip_plan
+
+    elif method == "step-aggr":
+        """
+        Skip enter step
+        diff_dict: {outer_key: {inner_key: [n_tokens]}}
+        It could be: {0: {step.0: [n_token]}}
+        """
+        skip_cost = []
+        for outer_key, inner_dict in diff_dict.items():
+            for inner_key, diff in inner_dict.items():
+                skip_cost.append(torch.sum(diff).item())
+        # Skip budget = skip_ratio * total tokens
+        total_count = len(diff_dict)
+        skip_budget = int(skip_ratio * total_count)
+        print(f"[skip-plan] total tokens: {total_count}, skip budget: {skip_budget} ({skip_ratio * 100:.1f}%)")
+        skip_token = np.argsort(skip_cost)[:skip_budget]
+        keep_token = np.setdiff1d(np.arange(total_count), skip_token).tolist()
+        print(keep_token, skip_cost)
+        return keep_token
+    
     else:
         raise ValueError(f"Unknown skip plan method: {method}")
 
@@ -116,7 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--cache_dir", type=str, default="G://models")
     parser.add_argument("--dataset_name", type=str, default="mjhq30k")
     parser.add_argument("--dataset_path", type=str, default="G://datasets/MJHQ-30K")
-    parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--num_steps", type=int, default=4)
     parser.add_argument("--guidance", type=float, default=4.5)
     parser.add_argument("--dit_inference_steps", type=str, default=None)
@@ -163,89 +256,22 @@ if __name__ == "__main__":
     ### attention: block.22.attn.attn_weights, block.22.attn.attn[before] v.s. block.22.attn.attn[after]
     ### FeedForward: block.22.ffn.before v.s. block.22.ffn.after; block.22.ff_context.before v.s. block.22.ff_context.after
     orientation = "layer"
-    # mean_matrix, _ = samples_to_avg(all_step_wise_computation_diff, orientation=orientation, concate_img_txt=True)
-    mean_matrix, _ = samples_to_avg(all_step_wise_computation_diff, orientation=orientation)
-    visualize(mean_matrix, f"{args.output_dir}/{orientation}_wise_mean{postfix}.png", orientation=orientation)
-    # Retrieve diff data
+    level = "layer"
+    mean_matrix, _ = samples_to_avg(all_step_wise_computation_diff, level=level, orientation=orientation)
     """
-    # sample_idx: {step_idx: {block_name: []}} => {block_name: [step_idx: [sample_idx, n_img]]}
-    layer_wise_img_diff = {} # {block_name: [step_idx: [sample_idx, n_img]]}
-    layer_wise_txt_diff = {}
-    attention_diff = {}
-    img_diff = {}
-    txt_diff = {}
-    attention_weights = {}
-    feed_forward_blocks_diff = {}
-    for sample_idx, step_wise_computation_diff in enumerate(all_step_wise_computation_diff):
-        sample_wise_computation_diff = {}
-        for step_idx, computation_diff in step_wise_computation_diff.items():
-            for key, value in computation_diff.items():
-                keys = key.split(".")
-                # For the whole joint block: block.22.img/txt: [bs, n_img, dim] => [n_img]
-                if len(keys) == 3:
-                    if keys[-1] == "img":
-                        if key not in layer_wise_img_diff:
-                            layer_wise_img_diff[key] = {}
-                        if step_idx not in layer_wise_img_diff[key]:
-                            layer_wise_img_diff[key][step_idx] = []
-                        layer_wise_img_diff[key][step_idx].append(value.unsqueeze(0)) # [n_img] => [step_idx, n_img]
-                        # print(f"{key}: {value.shape}")
-                    elif keys[-1] == "txt":
-                        if key not in layer_wise_txt_diff:
-                            layer_wise_txt_diff[key] = {}
-                        if step_idx not in layer_wise_txt_diff[key]:
-                            layer_wise_txt_diff[key][step_idx] = []
-                        layer_wise_txt_diff[key][step_idx].append(value.unsqueeze(0)) # [n_txt] => [step_idx, n_txt]
-                        # print(f"{key}: {value.shape}")
-                    else:
-                        raise ValueError(f"Unknown key: {key}")
-                # Within joint block: block.22.attn.img/txt/attn/attn_weights
-                else:
-                    print(f"Unsupported key: {key}")
-    
-    # Average diff data
-    img_mean_matrix = {} # {block_name: [step_idx, n_img]}
-    img_std_matrix = {}
-    txt_mean_matrix = {} # {block_name: [step_idx, n_txt]}
-    txt_std_matrix = {}
-    for prefix, mean_matrix, std_matrix, total_layer_wise_diff in (
-        ("img", img_mean_matrix, img_std_matrix, layer_wise_img_diff),
-        ("txt", txt_mean_matrix, txt_std_matrix, layer_wise_txt_diff),
-    ):
-        for block_name, layer_wise_diff in total_layer_wise_diff.items():
-            if block_name not in mean_matrix:
-                mean_matrix[block_name] = {}
-            if block_name not in std_matrix:
-                std_matrix[block_name] = {}
-            for step_idx, step_wise_diff in layer_wise_diff.items():
-                if step_idx not in mean_matrix[block_name]:
-                    mean_matrix[block_name][step_idx] = []
-                if step_idx not in std_matrix[block_name]:
-                    std_matrix[block_name][step_idx] = []
-                mean_matrix[block_name][step_idx] = torch.stack(step_wise_diff, dim=0).mean(0) # [sample_idx, n_img] => [n_img]
-                std_matrix[block_name][step_idx] = torch.stack(step_wise_diff, dim=0).std(0) # [sample_idx, n_img]
-        # visualize(mean_matrix, f"{args.output_dir}/layer_wise_{prefix}_mean{postfix}.png")
-        # visualize(std_matrix, f"{args.output_dir}/layer_wise_{prefix}_std{postfix}.png")  
-    
-    # Concat for better analysis
-    mean_matrix = {}
-    for block_name, block_wise_mean in img_mean_matrix.items():
-        layer_name = block_name[:-4]
-        if layer_name not in mean_matrix:
-            mean_matrix[layer_name] = {}
-        for step_idx, step_wise_mean in block_wise_mean.items():
-            txt_block_name = block_name.replace("img", "txt")
-            if txt_block_name in txt_mean_matrix and step_idx in txt_mean_matrix[txt_block_name]:
-                mean_matrix[layer_name][step_idx] = torch.cat([step_wise_mean, txt_mean_matrix[txt_block_name][step_idx]], dim=1)
-                # print(f"{block_name}, {step_idx}, {mean_matrix[layer_name][step_idx].shape}")
-            else:
-                mean_matrix[layer_name][step_idx] = step_wise_mean
-                # print(f"block_name: {block_name}, step_idx: {step_idx} not found in txt_mean_matrix")
-    visualize(mean_matrix, f"{args.output_dir}/layer_wise_mean_{postfix}.png")
+    visualize_computation_diff(
+        mean_matrix, orientation=orientation, level=level,
+        save_path=f"{args.output_dir}/{orientation}_wise_{level}_aggr_mean{postfix}.png"
+    )
     """
+    visualize_token_diff_distribution(mean_matrix, f"{args.output_dir}/{postfix}-token-diff-distribution.png")
     """
-    skip_ratio = 0.1
-    skip_plan = generate_skip_plan(mean_matrix, method="global", skip_ratio=skip_ratio)
-    with open(f"{args.output_dir}/token_skip_plan_{postfix}_global_{int(100*skip_ratio):02d}.json", "w") as f:
+    orientation = "layer"
+    level = "step"
+    mean_matrix, _ = samples_to_avg(all_step_wise_computation_diff, level=level, orientation=orientation)
+    skip_ratio = 0.5
+    # skip_plan = generate_skip_plan(mean_matrix, method="global", skip_ratio=skip_ratio)
+    skip_plan = generate_skip_plan(mean_matrix, method="step-aggr", skip_ratio=skip_ratio)
+    with open(f"{args.output_dir}/skip_plan/{postfix}-step-aggr-global-{int(100*skip_ratio):02d}.json", "w") as f:
         json.dump(skip_plan, f, indent=4)
     """

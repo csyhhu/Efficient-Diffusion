@@ -25,10 +25,10 @@ def load_samples(input_dir, postfix=""):
 
 def samples_to_avg(samples, level="layer", orientation="step", concate_img_txt=False):
     """Compute the average of samples.
-    level: "layer", "module"
+    level: "step", "layer", "module"
     orientation: "step", "layer"
 
-    samples: [{step_idx: {layer_name: n_token}}, {}, ...]
+    samples: [{step_idx: {layer_name: n_token}}, {step_name: n_token}, ...]
     orientation == "step", return {step_idx, {layer_name: [n_token]]}}
     orientation == "layer", return {layer_name, {step_idx: [n_token]]}}
     """
@@ -39,7 +39,9 @@ def samples_to_avg(samples, level="layer", orientation="step", concate_img_txt=F
             for layer_name, module_wise_diff in step_wise_diff.items():
                 module_wise_diff = module_wise_diff.reshape(1, -1)
                 keys = layer_name.split(".")
-                if len(keys) == 3 and level == "layer" or len(keys) == 4 and level == "module":
+                if (len(keys) == 2 and keys[0] == "step" and level == "step") or \
+                    (len(keys) == 3 and keys[0] == "block" and level == "layer") or \
+                    (len(keys) == 4 and level == "module"):
                     if orientation == "step":
                         if step_idx not in avg_dict:
                             avg_dict[step_idx] = {}
@@ -55,13 +57,14 @@ def samples_to_avg(samples, level="layer", orientation="step", concate_img_txt=F
                         else:
                             avg_dict[layer_name][step_idx].append(module_wise_diff)
                 else:
-                    print(f"{layer_name} is not suppored in {level}")
+                    # print(f"{layer_name} is not suppored in {level}")
+                    pass
 
     for outer_key, outer_dict in avg_dict.items():
         for inner_key, inner_dict in outer_dict.items():
             avg_dict[outer_key][inner_key] = torch.mean(torch.stack(inner_dict, dim=0), dim=0)
 
-    if concate_img_txt:
+    if concate_img_txt and level != "step":
         concat_avg_dict = {}
         concat_std_dict = {}
         if orientation == "step":
@@ -93,20 +96,25 @@ def samples_to_avg(samples, level="layer", orientation="step", concate_img_txt=F
     return avg_dict, std_dict
 
 
-def visualize(_diff_dict, save_path, orientation="step"):
-    n_vis = len(_diff_dict)
-    if n_vis == 0:
-        return
-    n_row = int(math.sqrt(n_vis))
-    n_col = max(1, n_vis // n_row)
-    if n_vis % n_row != 0:
-        n_row += 1
+def visualize_computation_diff(_diff_dict, save_path, orientation="step", level="layer"):
+
+    if level == "step":
+        n_row = n_col = 1
+    else:
+        n_vis = len(_diff_dict)
+        if n_vis == 0:
+            return
+        n_row = int(math.sqrt(n_vis))
+        n_col = max(1, n_vis // n_row)
+        if n_vis % n_row != 0:
+            n_row += 1
     cmap = 'RdYlGn_r'
     fig, axes = plt.subplots(n_row, n_col, figsize=(16, 16), squeeze=False)
     axes = axes.flatten()
 
     prev_step_idx = -1
     prev_layer_idx = -1
+    outer_diff_collect = []
     for idx, (outer_key, outer_diff_dict) in enumerate(_diff_dict.items()):
         # {step_idx: {layer_idx: [n_token]}} => step_idx x [n_layer, n_token] or 
         # {layer_name: {step_idx: [n_token]}} => layer_name x [n_step, n_token]
@@ -121,7 +129,7 @@ def visualize(_diff_dict, save_path, orientation="step"):
                 _layer_idx = int(inner_key.split(".")[1])
                 assert _layer_idx >= prev_layer_idx
                 prev_layer_idx = _layer_idx
-        else:
+        elif orientation == "layer":
             _layer_idx = int(outer_key.split(".")[1])
             assert _layer_idx >= prev_layer_idx
             prev_layer_idx = _layer_idx
@@ -130,6 +138,8 @@ def visualize(_diff_dict, save_path, orientation="step"):
                 _step_idx = int(inner_key)
                 assert _step_idx >= prev_step_idx
                 prev_step_idx = _step_idx
+        else:
+            raise ValueError(f"orientation {orientation} is not suppored")
 
         # Zero padding for last layer, for txt is processed in last layer
         inner_diff_collect = []
@@ -139,6 +149,9 @@ def visualize(_diff_dict, save_path, orientation="step"):
                 # print(f"0 padding for shape mismatch in [{inner_key}]: {_diff.shape} -> {inner_diff_collect[-1].shape}")
                 _diff = torch.cat([_diff, torch.zeros(1, inner_diff_collect[-1].shape[-1] - _diff.shape[-1])], dim=1)
             inner_diff_collect.append(_diff)
+            outer_diff_collect.append(_diff)
+        if level == "step":
+            continue
         _vis_diff = torch.cat(inner_diff_collect, dim=0).float().numpy()
         print(f"Visualize {outer_key} with shape {_vis_diff.shape}")
         ax = axes[idx]
@@ -146,6 +159,16 @@ def visualize(_diff_dict, save_path, orientation="step"):
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_title(outer_key)
+        plt.colorbar(im, ax=ax)
+
+    if level == "step":
+        _vis_diff = torch.cat(outer_diff_collect, dim=0).float().numpy()
+        print(f"Visualize {outer_key} with shape {_vis_diff.shape}")
+        ax = axes[0]
+        im = ax.imshow(_vis_diff, cmap=cmap, aspect='auto', interpolation='nearest')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        # ax.set_title()
         plt.colorbar(im, ax=ax)
         
     plt.tight_layout()

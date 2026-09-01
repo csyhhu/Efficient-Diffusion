@@ -1,10 +1,15 @@
 """
 python -m analysis.computation_diff.test_token_skip `
-    --skip_plan_path G://Outputs//Efficient-Diffusion//computation_diff//SD3-MJHQ30K//token_skip_plan_global_10.json
+    --skip_plan_path G://Outputs//Efficient-Diffusion//computation_diff//SD3-MJHQ30K//skip_plan/full-steps-cos-trial-1-global-50.json `
+    --postfix "cos-global-50"
+
+python -m analysis.computation_diff.test_token_skip `
+    --skip_plan_path G://Outputs//Efficient-Diffusion//computation_diff//SD3-MJHQ30K//skip_plan/full-steps-cos-step-aggr-global-50.json `
+    --postfix "cos-step-aggr-global-50"
     
 python -m analysis.computation_diff.test_token_skip `
     --dit_inference_steps "0,1,2,4,8,14,22,27" `
-    --skip_plan_path G://Outputs//Efficient-Diffusion//computation_diff//SD3-MJHQ30K//token_skip_plan_M8_l2_global_10.json
+    --skip_plan_path G://Outputs//Efficient-Diffusion//computation_diff//SD3-MJHQ30K//skip_plan/full-steps-cos-trial-1_M8_l2_global_10.json
 """
 
 import argparse
@@ -37,14 +42,21 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir", type=str, default="G://Outputs//Efficient-Diffusion//computation_diff//SD3-MJHQ30K")
+    parser.add_argument("--postfix", type=str, default=None)
 
     args = parser.parse_args()
     
     if args.skip_plan_path is not None:
         with open(args.skip_plan_path, "r") as f:
             skip_plan = json.load(f)
+            print(f"Loaded skip plan {len(skip_plan)}")
     else:
         skip_plan = None
+
+    dit_inference_steps = args.dit_inference_steps
+    if isinstance(skip_plan, list):
+        dit_inference_steps = skip_plan
+        print(f"Use skip plan as dit_inference_steps: {dit_inference_steps}")
     
     ImageGenerator = SD3ImageGenerator if args.model_id == "stabilityai/stable-diffusion-3.5-medium" else SD3ImageGenerator
     gen = ImageGenerator(
@@ -60,6 +72,7 @@ if __name__ == "__main__":
         num_samples=args.num_samples,
         save_root=args.output_dir,
         seed=args.seed,
-        dit_inference_steps=args.dit_inference_steps,
+        dit_inference_steps=dit_inference_steps,
         skip_plan=skip_plan,
+        save_postfix=args.postfix
     )

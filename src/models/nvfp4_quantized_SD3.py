@@ -851,22 +851,25 @@ class JointTransformerBlock(nn.Module):
         n_latent_seq = hidden_states.shape[1]
         n_txt_seq = encoder_hidden_states.shape[1]
         # print(skip_plan.keys())
+        latent_skip_token = None
+        text_skip_token = None
         if isinstance(skip_plan, dict):
-            token_skip_plan = skip_plan.get(f"{self.layer_prefix}", None)
-            # print(len(token_skip_plan))
-            if token_skip_plan is not None:
-                latent_skip_token = [t for t in token_skip_plan if t < n_latent_seq]
-                text_skip_token = [t - n_latent_seq for t in token_skip_plan if t >= n_latent_seq and t < n_txt_seq + n_latent_seq]
+            skip_token = skip_plan.get(f"{self.layer_prefix}", None)
+            latent_skip_token = skip_plan.get(f"{self.layer_prefix}.img", None)
+            text_skip_token = skip_plan.get(f"{self.layer_prefix}.txt", None)
+            # print(len(skip_token))
+            if skip_token is not None:
+                latent_skip_token = [t for t in skip_token if t < n_latent_seq]
+                text_skip_token = [t - n_latent_seq for t in skip_token if t >= n_latent_seq and t < n_txt_seq + n_latent_seq]
                 # print(len(latent_skip_token), len(text_skip_token))
+            elif latent_skip_token is not None and text_skip_token is not None: 
+                pass
             else:
                 latent_skip_token = None
                 text_skip_token = None
         elif isinstance(skip_plan, float):
             latent_skip_token = torch.randperm(n_latent_seq)[:int(skip_plan * n_latent_seq)]
             text_skip_token = torch.randperm(n_txt_seq)[:int(skip_plan * n_txt_seq)]
-        else:
-            latent_skip_token = None
-            text_skip_token = None
 
         if latent_skip_token is not None and len(latent_skip_token) > 0:
             full_hidden_states = hidden_states
@@ -973,7 +976,7 @@ class JointTransformerBlock(nn.Module):
             computation_diff_dict[f"{self.layer_prefix}.img"] = compute_computation_diff(img_before, img_after, dim=[0, -1])
             if encoder_hidden_states is not None:
                 txt_after = encoder_hidden_states
-                computation_diff_dict[f"{self.layer_prefix}.txt"] = compute_computation_diff(txt_before[:, :77, :], txt_after[:, :77, :], dim=[0, -1])
+                computation_diff_dict[f"{self.layer_prefix}.txt"] = compute_computation_diff(txt_before, txt_after, dim=[0, -1])
 
         return encoder_hidden_states, hidden_states
 
@@ -1303,7 +1306,6 @@ class NVFP4QuantizedSD3(nn.Module):
     # ------------------------------------------------------------------
     # Weight copy
     # ------------------------------------------------------------------
-
     def _copy_weights(self, ref):
         """Copy weights from HuggingFace SD3Transformer2DModel to this model."""
         # pos_embed: PatchEmbed.proj (Conv2d)

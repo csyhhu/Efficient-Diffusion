@@ -816,10 +816,11 @@ class BaseImageGenerator:
             else:
                 image = result
             if save_root is not None and save_name is not None:
+                save_postfix = kwargs.get('save_postfix', None)
                 save_name = f"{save_name}_{save_postfix}" if save_postfix is not None else save_name
                 print(f"  Saved -> {os.path.join(save_root, f"{save_name}.png")}")
                 os.makedirs(save_root, exist_ok=True)
-                # save_sample_grid(image, os.path.join(save_root, f"{save_name}.png"), nrow=visual_n_row)
+                save_sample_grid(image, os.path.join(save_root, f"{save_name}.png"), nrow=visual_n_row)
 
         print(f">> [{time.time() - cur_time:.2f}] Finish Generation")
         return result

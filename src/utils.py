@@ -294,7 +294,7 @@ def _shutdown_loaders(gen):
         torch.cuda.empty_cache()
 
 
-def compute_computation_diff(_before, _after, metric='L2', dim=[], eps=1e-8):
+def compute_computation_diff(_before, _after, metric='cos', dim=[], eps=1e-8):
     """
     Compute the difference metric between two tensors, supporting relative L1/L2 and cosine similarity.
 

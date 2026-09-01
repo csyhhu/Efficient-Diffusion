@@ -20,7 +20,7 @@ from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import c
 from src.image_generator.base import BaseImageGenerator
 from src.models.nvfp4_quantized_SD3 import NVFP4QuantizedSD3
 from src.modules.quantized_linear import NVFP4Linear
-from src.utils import save_sample_grid
+from src.utils import save_sample_grid, compute_computation_diff
 
 
 class SD3ImageGenerator(BaseImageGenerator):
@@ -107,12 +107,14 @@ class SD3ImageGenerator(BaseImageGenerator):
             pad = joint_dim - prompt_embeds.shape[-1]
             if pad > 0:
                 prompt_embeds = torch.nn.functional.pad(prompt_embeds, (0, pad))
+            # """
             batch_size = prompt_embeds.shape[0]
             t5_zeros = torch.zeros(
                 (batch_size, max_sequence_length, joint_dim),
                 device=self.device, dtype=self.dtype,
             )
             prompt_embeds = torch.cat([prompt_embeds, t5_zeros], dim=1)
+            # """
             return prompt_embeds, pooled_prompt_embeds
 
         prompt_embeds, pooled_prompt_embeds = _encode_one(prompt)
@@ -334,14 +336,14 @@ class SD3ImageGenerator(BaseImageGenerator):
         last_dit_output = None
         last_noise_pred = None
         for i, t in enumerate(timesteps):
-            run_dit = (dit_inference_steps is None) or (i in dit_inference_steps)
+            run_dit = (dit_inference_steps is None) or (i in dit_inference_steps) or i == 0
 
             if run_dit:
+                latent_before = latents.clone()
                 latent_model_input = (
                     torch.cat([latents] * 2, dim=0) if do_cfg else latents
                 )
                 timestep = t.expand(latent_model_input.shape[0])
-
                 dit_output = self.transformer(
                     hidden_states=latent_model_input.to(dtype=self.dtype),
                     timestep=timestep,
@@ -385,6 +387,9 @@ class SD3ImageGenerator(BaseImageGenerator):
                 latents = latents.to(latents_dtype)
             if intermediates_recorder is not None:
                 intermediates_recorder["scheduler_outputs"].append(latents.detach().cpu())
+            if return_computation_diff and run_dit:
+                step_wise_computation_diff[i][f"step.{i}"] = compute_computation_diff(latent_before, latents, dim=[0, -1])
+                print(f"Step [{i}] contains: {step_wise_computation_diff[i].keys()}")
 
         # ------------------------------------------------------------------
         # 5. VAE decode (latents / scaling_factor + shift_factor)
